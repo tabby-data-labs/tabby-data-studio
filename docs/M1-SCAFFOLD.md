@@ -7,18 +7,24 @@ through 1,000,000 synthetic rows × 30 columns at 60fps. **No database work at a
 
 Target: 9–13 focused days.
 
+> **Status: Phase 0 (Steps 0–8, 10) is complete and verified.** The app boots, the security model is
+> asserted by an automated smoke harness, and all gates are green. Steps 2–8 below are now a record
+> of what was built rather than instructions to follow. **Phase 1 (Step 9, the grid) is not started.**
+> See [M1 exit criteria](#m1-exit-criteria) and
+> [deviations found while executing](#deviations-found-while-executing-phase-0).
+
 ---
 
 ## Step 0 — Verify the toolchain
 
 Already installed via **nvm** (`~/.nvm`, `default` aliased to `24`). Verified 2026-09-23:
 
-| | |
-|---|---|
-| Node | **v24.21.0** · `~/.nvm/versions/node/v24.21.0/bin/node` |
-| npm | **11.19.0** |
-| corepack | present |
-| Platform | arm64 / darwin |
+|          |                                                         |
+| -------- | ------------------------------------------------------- |
+| Node     | **v24.21.0** · `~/.nvm/versions/node/v24.21.0/bin/node` |
+| npm      | **11.19.0**                                             |
+| corepack | present                                                 |
+| Platform | arm64 / darwin                                          |
 
 ```bash
 nvm use default
@@ -161,8 +167,8 @@ what `pg` and sandboxed preloads want):
     "test": "vitest run",
     "test:watch": "vitest",
     "deps:check": "npm ls --omit=dev --depth=10",
-    "pack:mac": "electron-vite build && electron-builder --mac"
-  }
+    "pack:mac": "electron-vite build && electron-builder --mac",
+  },
 }
 ```
 
@@ -267,7 +273,12 @@ resolves from `node_modules` at runtime. Bundling `pg` breaks its dynamic type-p
     "baseUrl": ".",
     "paths": { "@/*": ["src/renderer/src/*"], "@shared/*": ["src/shared/*"] }
   },
-  "include": ["src/renderer/src/**/*", "src/renderer/src/**/*.vue", "src/shared/**/*", "src/preload/index.d.ts"]
+  "include": [
+    "src/renderer/src/**/*",
+    "src/renderer/src/**/*.vue",
+    "src/shared/**/*",
+    "src/preload/index.d.ts"
+  ]
 }
 ```
 
@@ -290,7 +301,7 @@ function createWindow(): void {
   const win = new BrowserWindow({
     width: 1440,
     height: 900,
-    show: false,                       // reveal on ready-to-show: no white flash
+    show: false, // reveal on ready-to-show: no white flash
     backgroundColor: '#030b16',
     title: 'Tabby',
     webPreferences: {
@@ -316,7 +327,9 @@ function createWindow(): void {
 app.whenReady().then(() => {
   if (app.isPackaged) {
     session.defaultSession.webRequest.onHeadersReceived((details, cb) => {
-      cb({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [PROD_CSP] } });
+      cb({
+        responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [PROD_CSP] },
+      });
     });
   }
   applyNavigationGuards();
@@ -479,19 +492,19 @@ declare module '*.vue' {
 
 Build these in this order. Full specification in [`GRID-SPEC.md`](GRID-SPEC.md).
 
-| # | Module | File | Notes |
-|---|---|---|---|
-| 1 | Geometry | `grid/layout.ts` | Pure `computeGeometry()` + `hitTest()`. **Write the tests first** — §3 of the spec. |
-| 2 | Fake data | `grid/fake-source.ts` | `DataSource` impl, deterministic 1M×30 typed rows, seeded PRNG. |
-| 3 | Text cache | `grid/text-metrics.ts` | LRU `measureText` + `fit()` with ellipsis. |
-| 4 | Canvases | `grid/canvas-layers.ts` | 5 canvases, HiDPI setup, DPR-change listener. |
-| 5 | Painter | `grid/paint.ts` | bg → text → null → gridlines → selection → frozen shadow. Takes a `RenderingContext2D` so it is testable with a recording mock. |
-| 6 | Loop | `grid/render-loop.ts` | dirty-flag + single coalesced rAF. |
-| 7 | Scroll | `grid/scroll.ts` | wheel w/ `deltaMode`, shift+wheel, custom scrollbar, `scrollToRow`. |
-| 8 | Selection | `grid/selection.ts` | pure reducer over events → `SelectionState`. Table-driven tests for every row of spec §7. |
-| 9 | Columns | `grid/columns.ts` | resize drag, double-click auto-fit, frozen count. |
-| 10 | Facade | `grid/createDataGrid.ts` | the `DataGrid` API in spec §12. |
-| 11 | Adapter | `components/DataGridVue.vue` | ~80 lines. Mount/destroy, forward theme. **No reactivity inside the grid.** |
+| #   | Module     | File                         | Notes                                                                                                                           |
+| --- | ---------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Geometry   | `grid/layout.ts`             | Pure `computeGeometry()` + `hitTest()`. **Write the tests first** — §3 of the spec.                                             |
+| 2   | Fake data  | `grid/fake-source.ts`        | `DataSource` impl, deterministic 1M×30 typed rows, seeded PRNG.                                                                 |
+| 3   | Text cache | `grid/text-metrics.ts`       | LRU `measureText` + `fit()` with ellipsis.                                                                                      |
+| 4   | Canvases   | `grid/canvas-layers.ts`      | 5 canvases, HiDPI setup, DPR-change listener.                                                                                   |
+| 5   | Painter    | `grid/paint.ts`              | bg → text → null → gridlines → selection → frozen shadow. Takes a `RenderingContext2D` so it is testable with a recording mock. |
+| 6   | Loop       | `grid/render-loop.ts`        | dirty-flag + single coalesced rAF.                                                                                              |
+| 7   | Scroll     | `grid/scroll.ts`             | wheel w/ `deltaMode`, shift+wheel, custom scrollbar, `scrollToRow`.                                                             |
+| 8   | Selection  | `grid/selection.ts`          | pure reducer over events → `SelectionState`. Table-driven tests for every row of spec §7.                                       |
+| 9   | Columns    | `grid/columns.ts`            | resize drag, double-click auto-fit, frozen count.                                                                               |
+| 10  | Facade     | `grid/createDataGrid.ts`     | the `DataGrid` API in spec §12.                                                                                                 |
+| 11  | Adapter    | `components/DataGridVue.vue` | ~80 lines. Mount/destroy, forward theme. **No reactivity inside the grid.**                                                     |
 
 Enforce the boundary with ESLint in `eslint.config.js`:
 
@@ -540,16 +553,58 @@ Minimum M1 coverage:
 
 ## M1 exit criteria
 
-- [ ] `npm run dev` opens a window with no white flash and no DevTools security warnings
+### Phase 0 — ✅ complete (2026-09-23)
+
+- [x] `npm run dev` opens a window with no white flash (`backgroundColor` set, shown on `ready-to-show`)
+- [x] `npm run typecheck`, `npm run lint`, `npm test` all green — 0 errors, 10 tests passing
+- [x] `npm run deps:check` passes: runtime dependencies are exactly `pg@8.23.0`
+- [x] `npm run build` produces main / preload / renderer bundles
+- [x] `npm run smoke` + `npm run smoke:dev` pass 12 assertions each, with inverse CSP behaviour
+- [x] No `require` / `process` / `Buffer` leaked into the renderer; renderer runs `--enable-sandbox`
+- [x] All four ESLint boundary rules proven to fire against deliberate violations
+
+### Phase 1 — pending
+
 - [ ] Grid shows 1,000,000 rows × 30 columns of typed fake data with a frozen header row and frozen row-number column
 - [ ] Sustained **60fps** (p95 frame < 16.6ms) while scrolling fast, measured by the bench overlay — not eyeballed
 - [ ] Frozen panes stay pixel-aligned at fractional scroll offsets
 - [ ] Column resize works; double-click auto-fits; no listener or canvas leaks after repeated resizes
 - [ ] Click and shift-click selection highlight correctly, including in the frozen region
 - [ ] Moving the window to a different-DPI monitor keeps text crisp
-- [ ] `npm run typecheck`, `npm run lint`, `npm test` all green
-- [ ] `npm ls --omit=dev` lists only `pg` and its transitive deps
-- [ ] `npm run pack:mac` produces a `.dmg` that launches on a clean user account
+
+### Deferred to Phase 9
+
+- [ ] `npm run pack:mac` produces a `.dmg` that launches on a clean user account. The
+      `electron-builder.yml` config is written, but packaging has **not** been executed — it needs an
+      app icon in `build/` and a decision on code signing.
+
+---
+
+## Deviations found while executing Phase 0
+
+Recorded so the same traps are not hit again:
+
+1. **`baseUrl` is an error in TS 6, not a warning.** `TS5101: Option 'baseUrl' is deprecated and will
+stop functioning in TypeScript 7.0.` Both tsconfigs now use `paths` entries relative to the
+   config file (`"./src/shared/*"`), which is the forward-compatible form. This is TS 6 doing its
+   job as the bridge release — expect more of these.
+2. **Electron 44 has no postinstall script.** Its `package.json` has no `scripts` field at all, so
+   `node_modules/electron/dist` is legitimately missing right after `npm ci`. `index.js` downloads
+   the binary lazily on first `require('electron')` and verifies it against the bundled
+   `checksums.json`. Running `npm install-scripts approve electron` is pointless — there is nothing
+   to approve. The first `npm run dev` prints `Downloading Electron binary...` (~300 MB, then cached
+   in `~/Library/Caches/electron`).
+3. **npm 11 gates dependency install scripts by default.** It warns that `esbuild`, `fsevents`, and
+   `electron-winstaller` are "not covered by allowScripts". All three are deliberately left
+   unapproved: esbuild resolves its binary through the `@esbuild/darwin-arm64` optional dependency,
+   fsevents is an optional watcher optimisation, and electron-winstaller is Windows-only. Everything
+   builds, tests, and runs without them.
+4. **ESLint flat config ordering is load-bearing.** The last matching block wins, so a `no-console`
+   relaxation placed _before_ the global rules block is silently overridden. Relaxations must come
+   after.
+5. **A boundary rule that matches nothing is worse than no rule.** Each of the four restrictions was
+   verified against a temporary violating file, then the probes were deleted and the deletion
+   confirmed.
 
 ---
 

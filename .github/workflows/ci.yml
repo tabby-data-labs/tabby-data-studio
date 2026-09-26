@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    # arm64 runner: matches the primary packaging target.
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # nvm is not available on CI runners; setup-node reads .nvmrc instead.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Runtime dependency budget
+        run: npm run deps:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # Boots the real Electron main process and asserts the security model:
+      # no Node globals leak into the renderer, and the CSP actually blocks
+      # eval + inline scripts in prod while permitting them in dev.
+      - name: Smoke (prod CSP)
+        run: npm run smoke
+
+      - name: Smoke (dev CSP)
+        run: npm run smoke:dev
+
+      # Reported, not blocking: a transitive advisory in pg's tree should not
+      # stall unrelated work. Escalate to blocking once the tree is clean.
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=moderate
+        continue-on-error: true

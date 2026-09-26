@@ -1,0 +1,29 @@
+appId: com.tabby.desktop
+productName: Tabby
+directories:
+  buildResources: build
+  output: dist
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+  - '!**/*.ts'
+asar: true
+# No native modules (pg is pure JS), so there is nothing to rebuild per-arch.
+npmRebuild: false
+mac:
+  category: public.app-category.developer-tools
+  # arm64 is the primary target; x64 kept for Intel Macs until dropped.
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
+  hardenedRuntime: true
+  gatekeeperAssess: false
+dmg:
+  sign: false

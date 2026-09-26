@@ -1,0 +1,33 @@
+@import 'tailwindcss';
+
+/*
+ * Tailwind v4 is CSS-first: there is no tailwind.config.js. Tokens declared in
+ * @theme become utilities automatically (--color-line -> border-line).
+ */
+@theme {
+  --color-surface: #030b16;
+  --color-panel: #0a1626;
+  --color-line: #1c3a5e;
+  --color-accent: #3b76f0;
+  --color-ok: #7df9aa;
+  --color-warn: #fcf392;
+  --color-fg: #e6edf7;
+  --color-muted: #8ba0bb;
+
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-surface);
+  color: var(--color-fg);
+  font-family: var(--font-mono);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}

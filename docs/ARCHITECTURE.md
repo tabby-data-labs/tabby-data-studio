@@ -6,11 +6,11 @@ Back to [`PLAN.md`](../PLAN.md).
 
 ## 1. Process model
 
-| Process | Runtime | Responsibilities | Must never |
-|---|---|---|---|
-| **main** | Electron 44 / Node 24.21 | All `pg` access, connection lifecycle, cursors, result registry, schema introspection, settings + secrets, export-to-disk, IPC routing and validation | Touch the DOM; block the event loop with a long synchronous task |
-| **preload** | Sandboxed | Expose one frozen, typed `window.tabby` surface via `contextBridge` | Expose `ipcRenderer`, `require`, or any Node global |
-| **renderer** | Chromium 152, Vue 3.5 | All UI, the canvas grid, schema tree, query console, tabs | Import Node built-ins; construct SQL; hold a plaintext password |
+| Process      | Runtime                  | Responsibilities                                                                                                                                      | Must never                                                       |
+| ------------ | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **main**     | Electron 44 / Node 24.21 | All `pg` access, connection lifecycle, cursors, result registry, schema introspection, settings + secrets, export-to-disk, IPC routing and validation | Touch the DOM; block the event loop with a long synchronous task |
+| **preload**  | Sandboxed                | Expose one frozen, typed `window.tabby` surface via `contextBridge`                                                                                   | Expose `ipcRenderer`, `require`, or any Node global              |
+| **renderer** | Chromium 152, Vue 3.5    | All UI, the canvas grid, schema tree, query console, tabs                                                                                             | Import Node built-ins; construct SQL; hold a plaintext password  |
 
 With `sandbox: true`, the preload can only `require` a small polyfilled subset (`electron` renderer APIs, `events`, `timers`, `url`). Everything else — validation, crypto, SQL — lives in **main**. That constraint is a feature; do not relax it.
 
@@ -81,31 +81,31 @@ Defined once in `src/shared/ipc-contract.ts` and consumed by both sides.
 ```ts
 export const IpcChannel = {
   // connections
-  connList:      'conn:list',
-  connSave:      'conn:save',
-  connDelete:    'conn:delete',
-  connTest:      'conn:test',
-  connOpen:      'conn:open',
-  connClose:     'conn:close',
+  connList: 'conn:list',
+  connSave: 'conn:save',
+  connDelete: 'conn:delete',
+  connTest: 'conn:test',
+  connOpen: 'conn:open',
+  connClose: 'conn:close',
 
   // schema
-  schemaTree:    'schema:tree',
-  schemaTable:   'schema:table',      // columns, indexes, constraints, ddl
+  schemaTree: 'schema:tree',
+  schemaTable: 'schema:table', // columns, indexes, constraints, ddl
   schemaRefresh: 'schema:refresh',
 
   // queries
-  queryRun:      'query:run',         // → { resultId } immediately
-  queryCancel:   'query:cancel',
+  queryRun: 'query:run', // → { resultId } immediately
+  queryCancel: 'query:cancel',
 
   // results (windowed — never ship a whole result set)
-  resultMeta:    'result:meta',       // columns + rowCountEstimate
-  resultWindow:  'result:window',     // (resultId, startRow, rowCount) → columnar batch
+  resultMeta: 'result:meta', // columns + rowCountEstimate
+  resultWindow: 'result:window', // (resultId, startRow, rowCount) → columnar batch
   resultDispose: 'result:dispose',
 
   // events (main → renderer)
-  evQueryProgress:  'event:query-progress',
+  evQueryProgress: 'event:query-progress',
   evConnectionLost: 'event:connection-lost',
-  evResultEvicted:  'event:result-evicted',
+  evResultEvicted: 'event:result-evicted',
 } as const;
 ```
 
@@ -126,30 +126,30 @@ The grid depends on this and nothing else:
 export interface ColumnMeta {
   name: string;
   typeOid: number;
-  typeName: string;       // 'int8' | 'timestamptz' | 'jsonb' | …
+  typeName: string; // 'int8' | 'timestamptz' | 'jsonb' | …
   nullable: boolean;
-  widthHint: number;      // initial column width
+  widthHint: number; // initial column width
 }
 
 export type CellValue =
   | { kind: 'null' }
-  | { kind: 'bool';   value: boolean }
-  | { kind: 'number'; value: number; raw: string }   // raw avoids float display lies for numeric
-  | { kind: 'text';   value: string }
-  | { kind: 'time';   value: number; tz: string }     // epoch ms + original zone
+  | { kind: 'bool'; value: boolean }
+  | { kind: 'number'; value: number; raw: string } // raw avoids float display lies for numeric
+  | { kind: 'text'; value: string }
+  | { kind: 'time'; value: number; tz: string } // epoch ms + original zone
   | { kind: 'binary'; byteLength: number; preview: Uint8Array }
-  | { kind: 'json';   preview: string; byteLength: number }
-  | { kind: 'error';  message: string };              // parse failure shown inline, not fatal
+  | { kind: 'json'; preview: string; byteLength: number }
+  | { kind: 'error'; message: string }; // parse failure shown inline, not fatal
 
 export type RowBlock = {
   startRow: number;
   rowCount: number;
-  columns: CellValue[][];   // column-major: columns[c][r]
+  columns: CellValue[][]; // column-major: columns[c][r]
 };
 
 export interface DataSource {
   readonly columns: readonly ColumnMeta[];
-  readonly rowCount: number;              // -1 while unknown
+  readonly rowCount: number; // -1 while unknown
   readonly rowCountIsEstimate: boolean;
   getBlock(startRow: number, rowCount: number, signal: AbortSignal): Promise<RowBlock>;
   sort(columnIndex: number, direction: 'asc' | 'desc' | null): Promise<void>;
@@ -158,11 +158,11 @@ export interface DataSource {
 
 Three implementations, all satisfying the same contract:
 
-| Implementation | Used in | Notes |
-|---|---|---|
-| `FakeDataSource` | Phase 1–2, unit tests | Deterministic 1M×30 synthetic rows. Lets the grid be finished before any DB code exists. |
-| `RemoteDataSource` | Phase 5+ | Wraps IPC; read-ahead prefetch, in-flight dedupe, stale-response abort. |
-| `InMemoryDataSource` | Small results, tests | Whole result already local. |
+| Implementation       | Used in               | Notes                                                                                    |
+| -------------------- | --------------------- | ---------------------------------------------------------------------------------------- |
+| `FakeDataSource`     | Phase 1–2, unit tests | Deterministic 1M×30 synthetic rows. Lets the grid be finished before any DB code exists. |
+| `RemoteDataSource`   | Phase 5+              | Wraps IPC; read-ahead prefetch, in-flight dedupe, stale-response abort.                  |
+| `InMemoryDataSource` | Small results, tests  | Whole result already local.                                                              |
 
 Phase 5's exit criterion is that the grid's own API and tests do **not** change when `Fake` is swapped for `Remote`. If they do, the boundary was wrong — fix the boundary, not the grid.
 
@@ -223,7 +223,7 @@ Shipping 1M JS row objects across `contextBridge` is slow and memory-hungry. Ins
 - `timestamptz` → `Float64Array` of epoch ms
 - `bytea` → offset table + blob
 
-Decode lazily in the renderer into `CellValue` per *visible* cell only. Never decode a whole block eagerly.
+Decode lazily in the renderer into `CellValue` per _visible_ cell only. Never decode a whole block eagerly.
 
 ### 5.5 Cancellation
 
@@ -231,7 +231,7 @@ Capture `pg_backend_pid()` when a query starts, store it against the `resultId`,
 
 ### 5.6 Identifier safety
 
-`quoteIdent(s)`: reject anything outside `[A-Za-z0-9_$]` plus a length cap, then double any embedded `"`. All object names arriving from the renderer pass through it. All *values* go through `pg`'s parameter binding (`$1, $2`), never string interpolation.
+`quoteIdent(s)`: reject anything outside `[A-Za-z0-9_$]` plus a length cap, then double any embedded `"`. All object names arriving from the renderer pass through it. All _values_ go through `pg`'s parameter binding (`$1, $2`), never string interpolation.
 
 ---
 
@@ -239,12 +239,12 @@ Capture `pg_backend_pid()` when a query starts, store it against the `resultId`,
 
 ```ts
 interface RowIdentityResolver {
-  resolve(table: TableMeta): RowKey | null;   // PK or best unique index
+  resolve(table: TableMeta): RowKey | null; // PK or best unique index
 }
 interface ChangeBuffer {
   set(resultId: string, row: RowKey, col: string, next: CellValue): void;
   changesFor(row: RowKey): Change[];
-  toSql(): { text: string; values: unknown[] }[];   // built in MAIN, parameterised
+  toSql(): { text: string; values: unknown[] }[]; // built in MAIN, parameterised
 }
 ```
 
@@ -260,15 +260,15 @@ In v1 these exist as types with a no-op implementation so the grid, codec, and I
 new BrowserWindow({
   webPreferences: {
     preload: join(__dirname, '../preload/index.js'),
-    contextIsolation: true,     // required
-    nodeIntegration: false,     // required
-    sandbox: true,              // required
+    contextIsolation: true, // required
+    nodeIntegration: false, // required
+    sandbox: true, // required
     webSecurity: true,
     allowRunningInsecureContent: false,
     experimentalFeatures: false,
     spellcheck: false,
   },
-  show: false,                  // reveal on 'ready-to-show' to avoid white flash
+  show: false, // reveal on 'ready-to-show' to avoid white flash
 });
 ```
 
@@ -321,7 +321,12 @@ One tagged union in `src/shared/errors.ts`, so the renderer can branch on `code`
 type TabbyError =
   | { code: 'CONN_REFUSED' | 'AUTH_FAILED' | 'SSL_REQUIRED' | 'DNS_FAILED'; detail: string }
   | { code: 'QUERY_TIMEOUT' | 'QUERY_CANCELLED'; detail: string; sqlState?: string }
-  | { code: 'SYNTAX_ERROR' | 'RELATION_NOT_FOUND'; detail: string; sqlState: string; position?: number }
+  | {
+      code: 'SYNTAX_ERROR' | 'RELATION_NOT_FOUND';
+      detail: string;
+      sqlState: string;
+      position?: number;
+    }
   | { code: 'RESULT_EVICTED' | 'CURSOR_CLOSED'; resultId: string }
   | { code: 'PERMISSION_DENIED'; detail: string }
   | { code: 'VALIDATION_FAILED'; field: string }
@@ -336,10 +341,10 @@ Map `pg`'s `error.code` (SQLSTATE) to these in `driver-pg.ts` — the single pla
 
 Everything under `app.getPath('userData')`:
 
-| File | Format | Contents |
-|---|---|---|
-| `settings.json` | JSON | Connections (passwords ciphertext), theme, grid prefs, window geometry |
-| `history.jsonl` | Append-only JSONL, size-rotated | Query history |
-| `saved-queries.json` | JSON | Named queries |
+| File                 | Format                          | Contents                                                               |
+| -------------------- | ------------------------------- | ---------------------------------------------------------------------- |
+| `settings.json`      | JSON                            | Connections (passwords ciphertext), theme, grid prefs, window geometry |
+| `history.jsonl`      | Append-only JSONL, size-rotated | Query history                                                          |
+| `saved-queries.json` | JSON                            | Named queries                                                          |
 
 Atomic writes: write `settings.json.tmp` then `rename()`. No SQLite in v1 — it would add a native module and a rebuild step for every Electron upgrade, and nothing in v1 needs it.
