@@ -24,6 +24,7 @@
     "deps:check": "node scripts/check-deps.mjs",
     "smoke": "electron-vite build && electron out/main/smoke-main.js",
     "smoke:dev": "electron-vite build && TABBY_SMOKE_CSP=dev electron out/main/smoke-main.js",
+    "bench": "electron-vite build && electron out/main/bench-main.js",
     "verify": "npm run deps:check && npm run lint && npm run typecheck && npm test && npm run build",
     "pack:mac": "electron-vite build && electron-builder --mac"
   },

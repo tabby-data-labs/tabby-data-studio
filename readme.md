@@ -15,21 +15,26 @@ A desktop PostgreSQL database viewer with a from-scratch, Excel-like canvas data
 
 ## Status
 
-**Phase 0 complete** (2026-09-23) — scaffold, hardened Electron shell, tooling, and CI all verified
-green. Phase 1 (the canvas data grid) is next.
+**Phase 0 and Phase 1 complete** — a hardened Electron shell plus a from-scratch canvas data grid
+scrolling **1,000,000 rows × 30 columns at a measured 60fps**, with no database code involved.
+Phase 2 (Excel-grade interaction) is next.
 
-| Check                         | Result                                                             |
-| ----------------------------- | ------------------------------------------------------------------ |
-| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                 |
-| `npm run lint`                | ✅ 0 errors, 0 warnings                                            |
-| `npm run typecheck`           | ✅ node + web projects                                             |
-| `npm test`                    | ✅ 10 tests                                                        |
-| `npm run build`               | ✅ main 1.47 kB · preload 0.29 kB · renderer 194 kB + 9.28 kB CSS  |
-| `npm run smoke` (prod CSP)    | ✅ 12 assertions — `eval` and inline scripts **blocked**           |
-| `npm run smoke:dev` (dev CSP) | ✅ 12 assertions — both correctly **allowed** under the dev policy |
+| Check                         | Result                                                                  |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                      |
+| `npm run lint`                | ✅ 0 errors, 0 warnings                                                 |
+| `npm run typecheck`           | ✅ node + web projects                                                  |
+| `npm test`                    | ✅ **239 tests**, 14 files                                              |
+| `npm run build`               | ✅ main · preload · renderer, all three bundles                         |
+| `npm run smoke` (prod CSP)    | ✅ 16 assertions — grid paints, `eval` and inline scripts **blocked**   |
+| `npm run smoke:dev` (dev CSP) | ✅ 16 assertions — both correctly **allowed** under the dev policy      |
+| `npm run bench`               | ✅ **p95 paint 3.4ms** vs 10ms budget · **60.0 fps** · 1 dropped in 599 |
 
 Runtime confirmed as **Electron 44.4.5 / Chromium 152.0.7977.130 / Node 24.21.0**, with no
 `require`, `process`, or `Buffer` leaking into the renderer.
+
+The grid is 15 modules / ~3,200 lines in `src/renderer/src/grid/`, importing nothing from the app —
+enforced by an ESLint boundary rule so it stays headlessly testable and extractable.
 
 ## Getting started
 
@@ -42,6 +47,7 @@ npm run dev        # Vite dev server + Electron with HMR
 ```bash
 npm run verify     # deps:check + lint + typecheck + test + build
 npm run smoke      # boots real Electron, asserts the security model
+npm run bench      # 600-frame scroll benchmark — run on an otherwise idle machine
 npm run pack:mac   # produce a .dmg (Phase 9)
 ```
 

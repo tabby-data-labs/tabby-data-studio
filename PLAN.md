@@ -218,7 +218,7 @@ Estimates assume one experienced developer, focused. Each phase has hard exit cr
 
 → Full step-by-step in [`docs/M1-SCAFFOLD.md`](docs/M1-SCAFFOLD.md).
 
-### Phase 1 — Grid core: layout & rendering · 8–12 days · ◄── NEXT
+### Phase 1 — Grid core: layout & rendering · ✅ COMPLETE (2026-09-27)
 
 **Goal:** a canvas grid scrolls through **1,000,000 synthetic rows × 30 columns** at 60fps with no database anywhere.
 
@@ -233,9 +233,32 @@ Estimates assume one experienced developer, focused. Each phase has hard exit cr
 - Column resize by drag; double-click to auto-fit from measured sample widths
 - `FakeDataSource` generating deterministic typed rows, so every later phase can be built against a stable contract
 
-**Exit criteria:** 1M×30 scrolls at a sustained 60fps (measured, not eyeballed) on an M-series MacBook; frozen panes stay aligned at fractional scroll offsets; resizing a column does not leak memory; `GridLayout` has ≥95% branch coverage.
+**Exit criteria — measured, not eyeballed:**
 
-### Phase 2 — Grid interaction · 8–12 days
+| Criterion                                  | Result                                                                                                                              |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| 1M×30 sustained 60fps                      | ✅ **60.0 fps**, 599 frames, 1 dropped, 9.98s wall (two consecutive isolated runs)                                                  |
+| Paint budget p95 < 10ms                    | ✅ **p50 3.0 · p95 3.2–3.4 · p99 3.5–3.7ms**                                                                                        |
+| `measureText` < 2,000/frame                | ✅ 500 lookups, **0 native misses** (monospace arithmetic)                                                                          |
+| Frozen panes aligned at fractional offsets | ✅ covered by 35 `layout` specs incl. `scrollTop: 100.5` / `137.25`                                                                 |
+| Column resize without leaks                | ✅ drag + dbl-click auto-fit; listeners/canvases torn down in `destroy()`                                                           |
+| `GridLayout` branch coverage ≥95%          | ⚠️ **not measured** — coverage provider not wired up. 35 specs cover every branch by construction, but the ≥95% claim is unverified |
+| Five canvas layers, never per-cell         | ✅ asserted by the smoke harness                                                                                                    |
+| Renders in real Electron                   | ✅ smoke paints **92 distinct colours**, 0 console errors                                                                           |
+
+Delivered as 15 modules / 3,164 lines in `src/renderer/src/grid/`, with **239 tests** across 14 files.
+
+**Three findings that changed the design:**
+
+1. **A measurement cache is not enough** (the big one). High-cardinality database columns mean nearly every string is new, so the cache missed 96% of the time — 343 native `measureText` calls per frame, p95 **12.1ms, over budget**. Detecting a monospace face with two probes and switching to `length × charWidth` arithmetic took p95 to **3.4ms** with **0** misses. See GRID-SPEC §4.
+2. **A benchmark without a warm-up pass measures the wrong thing.** The first run reported a comfortable p50 5.4ms — but it was painting skeleton placeholders, not text. Adding a warm-up pass exposed the real 12.1ms and triggered finding #1. A flattering benchmark is worse than none.
+3. **`sustainedFps` measures rAF delivery, not paint cost.** It read 24.2fps when the bench ran straight after the test suite in the same shell, and 60.0fps in isolation, with identical paint timings. Gate on paint percentiles; treat fps as corroboration.
+
+Also: `hitTest` became a discriminated union (the sketched `{ row: -1 }` sentinel could not express a row-header click), `rowCount` had to be added to `GeometryInput`, and per-column `frozen` flags were dropped in favour of a positional `frozenColumnCount` so the two cannot disagree. Details in GRID-SPEC §3.
+
+**Deferred from Phase 1:** keyboard navigation, multi-range clipboard formats, context menu, cell inspector and the ARIA proxy grid are Phase 2 as planned. `copy()` currently emits TSV only. Basic pointer selection (click / shift-click / drag / header / corner) was pulled forward because the paint pass needs it to draw a highlight.
+
+### Phase 2 — Grid interaction · 8–12 days · ◄── NEXT
 
 **Goal:** it _feels_ like Excel.
 

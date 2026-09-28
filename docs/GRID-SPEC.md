@@ -61,42 +61,84 @@ Use `ctx.textRendering = 'geometricPrecision'` and disable image smoothing (noth
 
 `GridLayout` is a **pure function**. No DOM, no Vue, no state — inputs in, geometry out. This is where nearly all grid bugs live, so it gets nearly all the unit tests.
 
+> **Implemented as `grid/layout.ts` → `computeGeometry()`.** Three amendments to
+> the original sketch, all made during Phase 1:
+>
+> 1. **`rowCount` is a required input.** The sketch omitted it, but `lastRow`,
+>    `contentHeight` and `maxScrollTop` cannot be derived without it.
+> 2. **`hitTest` returns a discriminated union, not a `{ row: -1 }` sentinel.**
+>    The sentinel could not express a row-header click at all, and a union makes
+>    unhandled regions a compile error rather than a runtime surprise.
+> 3. **Frozen-ness is positional (`frozenColumnCount`), not a per-column flag.**
+>    Carrying both invites disagreement between them; deriving `frozen` on each
+>    `VisibleCol` removes an entire class of inconsistency bug.
+
 ```ts
-interface GridGeometryInput {
-  columns: readonly { width: number; frozen: boolean; visible: boolean }[];
+interface GeometryInput {
+  columns: readonly { width: number; visible: boolean }[];
+  rowCount: number;
   rowHeight: number; // fixed in v1
   headerHeight: number;
   rowHeaderWidth: number;
-  frozenColumnCount: number;
+  frozenColumnCount: number; // leading *visible* columns
   scrollTop: number;
   scrollLeft: number; // CSS px, fractional allowed
   viewportWidth: number;
   viewportHeight: number;
+  overscan?: number; // default 1
 }
 
+type HitResult =
+  | { kind: 'corner' }
+  | { kind: 'colHeader'; col: number }
+  | { kind: 'rowHeader'; row: number }
+  | { kind: 'cell'; row: number; col: number }
+  | { kind: 'outside' };
+
 interface GridGeometry {
+  rowCount: number;
   firstRow: number;
-  lastRow: number; // inclusive, absolute indices
+  lastRow: number; // inclusive; empty range is firstRow 0, lastRow -1
   firstCol: number;
   lastCol: number;
-  rowY(row: number): number; // absolute row → CSS y in body space
-  colX(col: number): number;
+  rowY(row: number): number; // body-local y
+  colX(col: number): number; // body-local x
   visibleRows: { row: number; y: number; height: number }[];
   visibleCols: { col: number; x: number; width: number; frozen: boolean }[];
-  frozenWidth: number; // total px of frozen columns
-  bodyHeight: number;
-  bodyWidth: number; // scrollable content extents
-  hitTest(x: number, y: number): { row: number; col: number } | { row: -1; col: number } | null;
+  frozenWidth: number;
+  contentWidth: number; // scrollable columns only
+  contentHeight: number; // rowCount * rowHeight
+  scrollAreaWidth: number; // bodyWidthPx - frozenWidth
+  scrollAreaHeight: number;
+  maxScrollLeft: number;
+  maxScrollTop: number;
+  scrollTop: number; // clamped to [0, max]
+  scrollLeft: number;
+  originX: number; // == rowHeaderWidth
+  originY: number; // == headerHeight
+  bodyWidthPx: number;
+  bodyHeightPx: number;
+  hitTest(x: number, y: number): HitResult; // takes HOST-relative coords
 }
 ```
+
+**The coordinate rule** (the part most likely to be got wrong later): horizontal
+coordinates are relative to `originX` and vertical coordinates to `originY`. The
+body canvas and the column-header canvas both start at `originX`; the body canvas
+and the row-header canvas both start at `originY`. So `colX` is valid on body +
+colHeader and `rowY` is valid on body + rowHeader, with no per-layer arithmetic
+at the call site. `hitTest` is the inverse and subtracts the origins itself.
 
 Key rules:
 
 - **Rows are fixed-height** in v1. `rowY(r) = r * rowHeight - scrollTop`. O(1) both directions — no accumulation, no binary search. Variable heights would force a prefix-sum index; deliberately out of scope.
 - **Frozen columns** are drawn at a fixed `x` in `[0, frozenWidth)` and excluded from `scrollLeft`. Scrollable columns start at `x = frozenWidth`.
-- **Overdraw**: extend the visible range by 1 row/column beyond the viewport so fast scrolling never shows a blank edge.
-- **Fractional offsets**: snap text drawing to integer device pixels (`Math.round(y * dpr) / dpr`) to avoid blurry glyphs, but keep the scroll offset itself fractional so inertia scrolling feels native.
+- **Overdraw**: extend the visible range by `overscan` rows/columns beyond the viewport so fast scrolling never shows a blank edge.
+- **Fractional offsets**: the scroll offset stays fractional so inertia scrolling feels native; 1px rules are snapped to half-pixels (`Math.round(x) + 0.5`) so they are crisp rather than smeared across two device pixels.
+- **Clamping is the layout's job.** Negative and past-the-end offsets are clamped inside `computeGeometry`, and `maxScrollTop`/`maxScrollLeft` are exposed so the scroll controller clamps identically. Two independent clamp implementations would drift.
 - `hitTest` must invert the frozen/non-frozen split correctly — clicking inside the frozen region maps to a frozen column regardless of `scrollLeft`.
+- **Pixels under the frozen band belong to the frozen column.** A scrollable column can be partly scrolled _underneath_ the frozen band; `hitTest` resolves those pixels to the frozen column, and the painter must clip to match (it does — see §4). Getting one of these right and the other wrong produces selection that is offset from what the user clicked.
+- **Hidden columns take zero width** and collapse onto their group boundary, so `colX` stays defined for every index and no caller needs a special case.
 
 Total scroll extent is `rowCount * rowHeight`, which for 10M rows is ~300M px — inside float64 range and fine for a synthetic scrollbar, but **do not** try to give a real DOM element that height.
 
@@ -125,20 +167,43 @@ invalidate()  ──►  needsRender = true
 - Batch by style: set `fillStyle`/`font` once per group, not per cell. Sort draws so all same-colour text goes together where practical.
 - Zebra striping: fill contiguous row bands in one `fillRect` per band, not per cell.
 
-### Text measurement cache
+### Text measurement — three tiers, cheapest first
 
 `ctx.measureText` per cell per frame is the single most common canvas-grid performance failure.
 
+> **Phase 1 finding: a measurement cache alone is NOT enough.** Database columns
+> are high-cardinality — ids, uuids, timestamps, hashes — so nearly every string
+> on screen is new and the cache misses on almost every cell. Measured on the
+> 1M×30 benchmark, a cache-only implementation ran at a **96% miss rate
+> (343 native `measureText` calls per frame)** and pushed p95 paint to
+> **12.1ms, over the 10ms budget**.
+>
+> The fix is that data grids use a **monospace** font, where width is exact
+> arithmetic. Two probes per font (`'i'` vs `'W'`) decide it; once detected,
+> width is `text.length * charWidth` and **zero** native measurements happen.
+> That took p95 from 12.1ms → **3.4ms** and misses from 343/frame → **0/frame**.
+
 ```ts
-class TextMetrics {
-  private cache = new Map<string, number>(); // `${fontKey}\u0000${text}` → width px
-  measure(ctx: CanvasRenderingContext2D, text: string): number;
-  fit(ctx, text: number, maxWidth: number): { text: string; truncated: boolean };
-  clear(): void; // on font or DPR change
+class TextMetricsCache {
+  measure(ctx: MeasureContext, text: string): number;
+  fit(ctx, text: string, maxWidth: number): FittedText;
+  invalidate(): void; // clears all three tiers
+  get stats(): { lookups: number; misses: number };
+  resetStats(): void;
 }
 ```
 
-LRU-cap at ~10,000 entries. `fit()` binary-searches the cut point and appends `…`. Cache is invalidated wholesale on font-family/size/DPR change — a stale cache produces subtly wrong ellipses that are very hard to diagnose later.
+Cost tiers, in order:
+
+1. **Monospace arithmetic** — `text.length * charWidth`, cached per font. The common path.
+2. **Measurement cache** — `Map<font\u0000text, width>`, LRU-capped at 10,000. For proportional faces.
+3. **Fit cache** — `Map<font\u0000maxWidth\u0000text, FittedText>`. `fit()` otherwise re-runs a binary search that allocates a fresh substring per probe; in a grid the same column repeats its `maxWidth` for every row and enum-like values repeat constantly. Skipped on the monospace path, where the search is already arithmetic and the Map churn would cost more than it saves.
+
+`fit()` returns the **largest** prefix that fits once `…` is appended, and must never exceed `maxWidth`. If even the ellipsis does not fit, it returns `''` with `truncated: true`.
+
+All three tiers are invalidated wholesale on font-family/size/DPR change — a stale entry produces subtly wrong ellipses that are very hard to diagnose later. Note this also drops monospace detection, so the first measure after an invalidate re-pays the two probes.
+
+`stats` exists so the §11 budget is a real measurement. A counter that is declared but never wired up reads `0` and looks like success — that happened here and was caught only because the benchmark asserted the value was non-zero.
 
 ---
 
@@ -279,16 +344,25 @@ A canvas exposes nothing to assistive tech. Build a proxy:
 
 Perf is a feature that silently rots, so measure it in CI-adjacent tooling from Phase 1.
 
-| Metric                                 | Budget            | How measured                             |
-| -------------------------------------- | ----------------- | ---------------------------------------- |
-| Frame time while scrolling 1M×30       | p95 < 16.6ms      | rAF timestamp deltas over 600 frames     |
-| Paint time per frame                   | < 10ms            | `performance.mark` around the paint pass |
-| `measureText` calls per frame          | < 2,000           | counter on the cache                     |
-| Time to first paint after data arrives | < 100ms           | mark/measure                             |
-| Heap after 10 min of scrolling         | no growth trend   | `performance.memory` sampling            |
-| Canvas count                           | 5, never per-cell | static assertion                         |
+Implemented as `grid/bench.ts` + `src/main/bench-main.ts`, run via `npm run bench`.
 
-A recording mock 2D context (a plain object capturing method calls and args) makes the paint pass **unit-testable without any native canvas package** — assert the draw-call sequence for a given geometry rather than snapshotting pixels. This keeps the test suite dependency-free, which matters given the project's supply-chain posture.
+| Metric                                 | Budget            | How measured                                                  | Phase 1 measured (1M×30, 600 frames)         |
+| -------------------------------------- | ----------------- | ------------------------------------------------------------- | -------------------------------------------- |
+| Paint time per frame                   | p95 < 10ms        | `performance.now()` around the frame callback in `RenderLoop` | **p50 3.0 · p95 3.2–3.4 · p99 3.5–3.7ms** ✅ |
+| Frame delivery while scrolling         | 60fps sustained   | rAF count / wall time                                         | **60.0 fps, 1 dropped in 599** ✅            |
+| `measureText` calls per frame          | < 2,000           | `TextMetricsCache.stats`                                      | **500 lookups, 0 native misses** ✅          |
+| Canvas count                           | 5, never per-cell | static assertion in the smoke harness                         | **5** ✅                                     |
+| Time to first paint after data arrives | < 100ms           | mark/measure                                                  | not yet instrumented — Phase 2               |
+| Heap after 10 min of scrolling         | no growth trend   | `performance.memory` sampling                                 | not yet instrumented — Phase 2               |
+
+**Two measurement traps found the hard way:**
+
+1. **A benchmark without a warm-up pass measures the wrong thing.** The first run paints skeleton placeholders for blocks that have not arrived, which is far cheaper than painting text. The initial (misleading) reading was p50 5.4ms; adding a warm-up pass revealed the true p95 of 12.1ms, which was _over_ budget and led to the monospace fix in §4.
+2. **`sustainedFps` measures rAF delivery, not paint cost**, so it collapses under CPU contention. Observed 24.2fps when the bench was launched immediately after a test run in the same shell, versus 60.0fps in isolation — with near-identical paint timings. Always run `npm run bench` on its own, gate on the paint percentiles, and treat fps as corroboration.
+
+In CI the benchmark is **reported, not blocking**: a 600-frame CPU-bound measurement on a shared runner is too noisy for a hard gate. Run it locally for the gating assertion.
+
+A recording mock 2D context (a Proxy capturing method calls, args, _and_ property assignments as `set:<name>`) makes the paint pass **unit-testable without any native canvas package** — assert the draw-call sequence for a given geometry rather than snapshotting pixels. Recording style assignments too is what lets a test prove "background before text" rather than merely "text was drawn". This keeps the test suite dependency-free, which matters given the project's supply-chain posture.
 
 ---
 

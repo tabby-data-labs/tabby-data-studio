@@ -86,12 +86,10 @@ app.whenReady().then(async () => {
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
   await win.loadURL(target);
-  // Let the rAF probe run enough frames for the fps reading to settle.
+  // Let the render loop paint enough frames that the data window has resolved.
   await new Promise((resolve) => setTimeout(resolve, 3000));
 
   const report = (await win.webContents.executeJavaScript(`(() => {
-    const canvas = document.querySelector('canvas');
-
     let evalBlocked = false;
     try { (0, eval)('1 + 1'); } catch { evalBlocked = true; }
 
@@ -103,6 +101,25 @@ app.whenReady().then(async () => {
       inlineScriptBlocked = window.__tabbyCspProbe === undefined;
     } catch { inlineScriptBlocked = true; }
 
+    // Five stacked canvases; the body layer is first in document order.
+    const canvases = Array.from(document.querySelectorAll('canvas'));
+    const body = canvases[0] ?? null;
+
+    // Prove pixels were actually drawn, not merely that a canvas exists.
+    // Sampled sparsely: reading a full HiDPI backing store is slow.
+    let distinctColors = 0;
+    if (body && body.width > 0 && body.height > 0) {
+      const probe = body.getContext('2d');
+      if (probe) {
+        const data = probe.getImageData(0, 0, body.width, body.height).data;
+        const seen = new Set();
+        for (let i = 0; i < data.length; i += 4 * 997) {
+          seen.add(data[i] + ',' + data[i + 1] + ',' + data[i + 2]);
+        }
+        distinctColors = seen.size;
+      }
+    }
+
     return {
       title: document.title,
       bridgeType: typeof window.tabby,
@@ -110,11 +127,12 @@ app.whenReady().then(async () => {
       requireLeaked: typeof window.require !== 'undefined',
       processLeaked: typeof window.process !== 'undefined',
       bufferLeaked: typeof window.Buffer !== 'undefined',
-      checkCount: document.querySelectorAll('li').length,
-      canvas: canvas ? { w: canvas.width, h: canvas.height } : null,
+      canvasCount: canvases.length,
+      canvasesSized: canvases.every((c) => c.width > 0 && c.height > 0),
+      distinctColors,
+      buttons: document.querySelectorAll('button').length,
+      footerText: document.querySelector('footer') ? document.querySelector('footer').innerText : '',
       bodyBackground: getComputedStyle(document.body).backgroundColor,
-      fontFamily: getComputedStyle(document.body).fontFamily,
-      fps: document.body.innerText.match(/(\\d+) fps/)?.[1] ?? null,
       evalBlocked,
       inlineScriptBlocked,
     };
@@ -127,10 +145,12 @@ app.whenReady().then(async () => {
     requireLeaked: boolean;
     processLeaked: boolean;
     bufferLeaked: boolean;
-    checkCount: number;
-    canvas: { w: number } | null;
+    canvasCount: number;
+    canvasesSized: boolean;
+    distinctColors: number;
+    buttons: number;
+    footerText: string;
     bodyBackground: string;
-    fps: string | null;
     evalBlocked: boolean;
     inlineScriptBlocked: boolean;
   };
@@ -141,10 +161,13 @@ app.whenReady().then(async () => {
     ['window.require not leaked', r.requireLeaked === false],
     ['window.process not leaked', r.processLeaked === false],
     ['window.Buffer not leaked', r.bufferLeaked === false],
-    ['status checks rendered', r.checkCount >= 7],
-    ['canvas has a HiDPI backing store', (r.canvas?.w ?? 0) > 0],
+    ['five canvas layers mounted', r.canvasCount === 5],
+    ['every layer has a HiDPI backing store', r.canvasesSized],
+    // background + stripe + text/gridline means cells were painted, not just cleared
+    ['the grid painted pixels', r.distinctColors > 3],
+    ['toolbar rendered', r.buttons >= 4],
+    ['status bar mounted', r.footerText.length > 0],
     ['tailwind @theme token applied', r.bodyBackground === 'rgb(3, 11, 22)'],
-    ['rAF loop produced an fps reading', r.fps !== null],
     [`eval ${strict ? 'blocked' : 'allowed'} under ${profile} CSP`, r.evalBlocked === strict],
     [
       `inline script ${strict ? 'blocked' : 'allowed'} under ${profile} CSP`,

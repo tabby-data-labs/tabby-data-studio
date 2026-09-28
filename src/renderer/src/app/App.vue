@@ -1,151 +1,196 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, shallowRef } from 'vue';
+import DataGridVue from '@/components/DataGridVue.vue';
+import { runScrollBench, type BenchResult } from '@/grid/bench';
+import type { DataGrid } from '@/grid/create-data-grid';
+import { FakeDataSource } from '@/grid/fake-source';
+import { boundingBox, selectedCellCount } from '@/grid/selection';
+import type { SelectionState, SortSpec } from '@/grid/types';
 
-interface Check {
-  readonly label: string;
-  readonly ok: boolean;
-  readonly detail: string;
-}
+const ROW_COUNT = 1_000_000;
+const COLUMN_COUNT = 30;
 
+const source = new FakeDataSource({
+  rowCount: ROW_COUNT,
+  columnCount: COLUMN_COUNT,
+  seed: 20260923,
+});
+
+const grid = shallowRef<DataGrid | null>(null);
+const frozen = ref(1);
+const selection = ref<SelectionState | null>(null);
+const bench = ref<BenchResult | null>(null);
+const benching = ref(false);
+const sort = ref<SortSpec | null>(null);
+const notice = ref<string | null>(null);
 const versions = ref<{ electron: string; chrome: string; node: string } | null>(null);
-const canvasRef = ref<HTMLCanvasElement | null>(null);
-const canvasOk = ref(false);
-const dpr = ref(1);
-const fps = ref<number | null>(null);
-
-let frame = 0;
-let lastSample = 0;
-let rafId = 0;
-
-/**
- * A throwaway canvas probe: proves the 2D pipeline, HiDPI backing-store setup
- * and the rAF loop all work before Phase 1 builds the real grid on top of them.
- */
-function paintProbe(ctx: CanvasRenderingContext2D, width: number, height: number): void {
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = '#0a1626';
-  ctx.fillRect(0, 0, width, height);
-
-  const rowHeight = 22;
-  const cols = [40, 150, 110, 130, 90];
-  for (let r = 0; r * rowHeight < height; r += 1) {
-    if (r % 2 === 1) {
-      ctx.fillStyle = 'rgba(28, 58, 94, 0.25)';
-      ctx.fillRect(0, r * rowHeight, width, rowHeight);
-    }
-    let x = 0;
-    for (let c = 0; c < cols.length; c += 1) {
-      const w = cols[c] ?? 80;
-      ctx.fillStyle = '#8ba0bb';
-      ctx.font = '11px ui-monospace, monospace';
-      ctx.fillText(`r${r}c${c}`, x + 8, r * rowHeight + 15);
-      ctx.strokeStyle = 'rgba(28, 58, 94, 0.9)';
-      ctx.strokeRect(x + 0.5, r * rowHeight + 0.5, w - 1, rowHeight - 1);
-      x += w;
-    }
-  }
-}
-
-function tick(now: number): void {
-  frame += 1;
-  if (lastSample === 0) lastSample = now;
-  const elapsed = now - lastSample;
-  if (elapsed >= 1000) {
-    fps.value = Math.round((frame * 1000) / elapsed);
-    frame = 0;
-    lastSample = now;
-  }
-  const ctx = canvasRef.value?.getContext('2d');
-  if (ctx) {
-    const d = dpr.value;
-    ctx.setTransform(d, 0, 0, d, 0, 0);
-    paintProbe(ctx, ctx.canvas.width / d, ctx.canvas.height / d);
-  }
-  rafId = requestAnimationFrame(tick);
-}
 
 onMounted(() => {
-  const bridge = window.tabby;
-  if (bridge) {
-    versions.value = { ...bridge.versions };
-  }
-
-  const el = canvasRef.value;
-  if (el) {
-    const ctx = el.getContext('2d');
-    canvasOk.value = ctx !== null;
-    dpr.value = window.devicePixelRatio || 1;
-    const rect = el.getBoundingClientRect();
-    el.width = Math.round(rect.width * dpr.value);
-    el.height = Math.round(rect.height * dpr.value);
-    rafId = requestAnimationFrame(tick);
-  }
+  if (window.tabby) versions.value = { ...window.tabby.versions };
 });
 
-onBeforeUnmount(() => {
-  if (rafId !== 0) cancelAnimationFrame(rafId);
+const selectionSummary = computed(() => {
+  const current = selection.value;
+  if (!current || current.ranges.length === 0) return 'No selection';
+  const box = boundingBox(current);
+  if (!box) return 'No selection';
+  const cells = selectedCellCount(current);
+  const ranges = current.ranges.length > 1 ? ` · ${current.ranges.length} ranges` : '';
+  return `${cells.toLocaleString()} cell${cells === 1 ? '' : 's'} · rows ${box.start.row + 1}–${
+    box.end.row + 1
+  } · cols ${box.start.col + 1}–${box.end.col + 1}${ranges}`;
 });
 
-const checks = computed<Check[]>(() => [
-  { label: 'Electron main process', ok: true, detail: `v${versions.value?.electron ?? '?'}` },
-  { label: 'contextIsolation bridge', ok: versions.value !== null, detail: 'window.tabby' },
-  { label: 'Chromium renderer', ok: true, detail: `v${versions.value?.chrome ?? '?'}` },
-  { label: 'Node (main)', ok: true, detail: `v${versions.value?.node ?? '?'}` },
-  { label: 'Tailwind v4 utilities', ok: true, detail: '@theme tokens' },
-  {
-    label: 'Canvas 2D + HiDPI',
-    ok: canvasOk.value,
-    detail: `${dpr.value.toFixed(2)}x dpr`,
-  },
-  {
-    label: 'requestAnimationFrame loop',
-    ok: fps.value !== null,
-    detail: `${fps.value ?? '—'} fps`,
-  },
-]);
+function onReady(instance: DataGrid): void {
+  grid.value = instance;
+}
+
+/**
+ * Machine-readable copy of the last bench result. The perf gate in
+ * src/main/bench-main.ts drives the real UI button and reads this back, so the
+ * measurement exercises the same code path a user would.
+ */
+const benchJson = computed(() => (bench.value ? JSON.stringify(bench.value) : ''));
+
+async function onBench(): Promise<void> {
+  if (!grid.value || benching.value) return;
+  benching.value = true;
+  notice.value = null;
+  try {
+    bench.value = await runScrollBench(grid.value, {
+      frames: 600,
+      rowsPerFrame: 40,
+      rowCount: ROW_COUNT,
+    });
+  } finally {
+    benching.value = false;
+  }
+}
+
+async function onCopy(): Promise<void> {
+  if (!grid.value) return;
+  try {
+    await grid.value.copy();
+    notice.value = 'Copied as TSV';
+  } catch {
+    notice.value = 'Copy failed — clipboard unavailable';
+  }
+}
+
+async function onToggleSort(): Promise<void> {
+  if (!grid.value) return;
+  const next: SortSpec | null =
+    sort.value === null
+      ? { columnIndex: 1, direction: 'asc' }
+      : sort.value.direction === 'asc'
+        ? { columnIndex: 1, direction: 'desc' }
+        : null;
+  sort.value = next;
+  await grid.value.setSort(next);
+}
+
+function onFreeze(delta: number): void {
+  frozen.value = Math.max(0, Math.min(COLUMN_COUNT, frozen.value + delta));
+}
+
+function onGoToRow(): void {
+  const raw = window.prompt(`Go to row (1 – ${ROW_COUNT.toLocaleString()})`);
+  if (!raw) return;
+  const row = Number.parseInt(raw, 10);
+  if (!Number.isFinite(row)) return;
+  grid.value?.scrollToRow(Math.max(0, Math.min(ROW_COUNT - 1, row - 1)), 'center');
+}
 </script>
 
 <template>
   <div class="flex h-full flex-col bg-surface">
-    <header class="flex items-baseline gap-3 border-b border-line bg-panel px-5 py-3">
+    <header class="flex items-baseline gap-3 border-b border-line bg-panel px-4 py-2">
       <h1 class="text-sm font-semibold tracking-wide text-fg">Tabby</h1>
-      <span class="text-xs text-muted">Phase 0 — scaffold verification</span>
+      <span class="text-xs text-muted">Phase 1 — canvas data grid</span>
+      <span class="ml-auto text-[11px] text-muted">
+        {{ ROW_COUNT.toLocaleString() }} rows × {{ COLUMN_COUNT }} cols · synthetic
+        <template v-if="versions">
+          · Electron {{ versions.electron }} · Chromium {{ versions.chrome }}
+        </template>
+      </span>
     </header>
 
-    <main class="flex flex-1 gap-6 overflow-auto p-6">
-      <section class="w-80 shrink-0">
-        <h2 class="mb-3 text-xs font-semibold uppercase tracking-wider text-muted">Checks</h2>
-        <ul class="space-y-2">
-          <li
-            v-for="check in checks"
-            :key="check.label"
-            class="flex items-start gap-3 rounded border border-line bg-panel px-3 py-2"
-          >
-            <span
-              class="mt-0.5 shrink-0 text-xs"
-              :class="check.ok ? 'text-ok' : 'text-warn'"
-              :aria-label="check.ok ? 'pass' : 'pending'"
-            >
-              {{ check.ok ? '✔' : '✗' }}
-            </span>
-            <span class="min-w-0">
-              <span class="block truncate text-xs text-fg">{{ check.label }}</span>
-              <span class="block truncate text-[11px] text-muted">{{ check.detail }}</span>
-            </span>
-          </li>
-        </ul>
-      </section>
+    <div class="flex flex-wrap items-center gap-2 border-b border-line bg-panel px-4 py-2 text-xs">
+      <button type="button" class="btn" :disabled="benching" @click="onBench">
+        {{ benching ? 'Benching…' : 'Run 600-frame bench' }}
+      </button>
+      <button type="button" class="btn" @click="onCopy">Copy TSV</button>
+      <button type="button" class="btn" @click="onToggleSort">
+        Sort col 2: {{ sort ? sort.direction : 'off' }}
+      </button>
+      <button type="button" class="btn" @click="onGoToRow">Go to row…</button>
 
-      <section class="flex min-w-0 flex-1 flex-col">
-        <h2 class="mb-3 text-xs font-semibold uppercase tracking-wider text-muted">
-          Canvas probe — Phase 1 replaces this with the data grid
-        </h2>
-        <canvas
-          ref="canvasRef"
-          class="h-full w-full flex-1 rounded border border-line"
-          aria-hidden="true"
-        />
-      </section>
+      <span class="ml-2 flex items-center gap-1">
+        <span class="text-muted">Frozen</span>
+        <button type="button" class="btn" @click="onFreeze(-1)">−</button>
+        <span class="w-4 text-center text-fg">{{ frozen }}</span>
+        <button type="button" class="btn" @click="onFreeze(1)">+</button>
+      </span>
+
+      <span v-if="notice" class="ml-auto text-ok">{{ notice }}</span>
+    </div>
+
+    <div
+      v-if="bench"
+      class="flex flex-wrap gap-x-5 gap-y-1 border-b border-line bg-panel px-4 py-2 text-[11px]"
+    >
+      <span :class="bench.withinBudget ? 'text-ok' : 'text-warn'" class="font-semibold">
+        p95 {{ bench.p95.toFixed(2) }}ms / {{ bench.budgetP95Ms.toFixed(1) }}ms budget —
+        {{ bench.withinBudget ? 'WITHIN' : 'OVER' }}
+      </span>
+      <span class="text-muted">p50 {{ bench.p50.toFixed(2) }}ms</span>
+      <span class="text-muted">p99 {{ bench.p99.toFixed(2) }}ms</span>
+      <span class="text-muted">{{ bench.frames }} frames</span>
+      <span :class="bench.dropped === 0 ? 'text-muted' : 'text-warn'">
+        {{ bench.dropped }} dropped
+      </span>
+      <span class="text-muted">{{ bench.sustainedFps.toFixed(1) }} fps sustained</span>
+      <span class="text-muted">{{ bench.measureTextCalls.toLocaleString() }} measureText</span>
+    </div>
+
+    <main class="min-h-0 flex-1">
+      <DataGridVue
+        :source="source"
+        :frozen-column-count="frozen"
+        label="Synthetic query result"
+        @ready="onReady"
+        @selection="selection = $event"
+      />
     </main>
+
+    <footer
+      class="flex items-center gap-4 border-t border-line bg-panel px-4 py-1.5 text-[11px] text-muted"
+    >
+      <span>{{ selectionSummary }}</span>
+      <span class="ml-auto">
+        drag to select · shift-click to extend · drag a column border to resize · double-click to
+        auto-fit
+      </span>
+    </footer>
+
+    <div hidden data-bench-json>{{ benchJson }}</div>
   </div>
 </template>
+
+<style scoped>
+.btn {
+  border: 1px solid var(--color-line);
+  border-radius: 4px;
+  padding: 3px 8px;
+  color: var(--color-fg);
+  background: rgba(28, 58, 94, 0.25);
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) {
+  background: rgba(59, 118, 240, 0.25);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+</style>

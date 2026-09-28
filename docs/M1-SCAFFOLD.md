@@ -563,14 +563,31 @@ Minimum M1 coverage:
 - [x] No `require` / `process` / `Buffer` leaked into the renderer; renderer runs `--enable-sandbox`
 - [x] All four ESLint boundary rules proven to fire against deliberate violations
 
-### Phase 1 — pending
+### Phase 1 — ✅ complete (2026-09-27)
 
-- [ ] Grid shows 1,000,000 rows × 30 columns of typed fake data with a frozen header row and frozen row-number column
-- [ ] Sustained **60fps** (p95 frame < 16.6ms) while scrolling fast, measured by the bench overlay — not eyeballed
-- [ ] Frozen panes stay pixel-aligned at fractional scroll offsets
-- [ ] Column resize works; double-click auto-fits; no listener or canvas leaks after repeated resizes
-- [ ] Click and shift-click selection highlight correctly, including in the frozen region
-- [ ] Moving the window to a different-DPI monitor keeps text crisp
+- [x] Grid shows 1,000,000 rows × 30 columns of typed fake data with a frozen header row and frozen row-number column
+- [x] Sustained **60fps** while scrolling fast, measured by `npm run bench` — 599 frames, 1 dropped, 9.98s wall, two consecutive isolated runs
+- [x] Paint budget met: p50 3.0ms · **p95 3.2–3.4ms** · p99 3.5–3.7ms against a 10ms budget
+- [x] Frozen panes stay pixel-aligned at fractional scroll offsets (35 layout specs incl. `scrollTop: 100.5` / `137.25`)
+- [x] Column resize works; double-click auto-fits; `destroy()` removes every listener, canvas and observer
+- [x] Click, shift-click, drag, header and corner selection highlight correctly, including in the frozen region
+- [x] HiDPI: backing stores scale by `devicePixelRatio`, and the DPR transform is re-applied on every resize (asserted in `grid-canvas-layers.spec.ts`)
+- [x] 239 tests across 14 files; typecheck, lint, prettier, build, smoke, smoke:dev, bench all green
+
+**Not verified:** moving the window to a different-DPI _physical monitor_ — the code path is
+implemented and unit-tested (a `matchMedia` resolution watcher re-arms and triggers a re-measure),
+but confirming text stays crisp requires a second display and a human eye.
+
+**Not claimed:** the plan's "≥95% branch coverage" for `GridLayout`. No coverage provider is wired
+up, so that number is unmeasured. The 35 layout specs were written to cover every branch by
+construction, but that is an assertion about intent, not a measurement.
+
+### Deferred to Phase 2
+
+- [ ] Keyboard navigation (arrows, Page Up/Down, Home/End, Tab/Enter)
+- [ ] Clipboard beyond TSV: CSV, JSON, SQL `INSERT`, Markdown
+- [ ] Context menu, cell tooltip, Cell Inspector
+- [ ] ARIA proxy grid — only a live region announcing the selection exists today
 
 ### Deferred to Phase 9
 

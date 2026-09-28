@@ -14,6 +14,8 @@ export default defineConfig({
           index: resolve(__dirname, 'src/main/index.ts'),
           // Second main entry so the smoke test runs the real security guards.
           'smoke-main': resolve(__dirname, 'src/main/smoke-main.ts'),
+          // Third entry drives the automated performance gate.
+          'bench-main': resolve(__dirname, 'src/main/bench-main.ts'),
         },
       },
     },

@@ -30,6 +30,10 @@
     "src/renderer/src/**/*",
     "src/renderer/src/**/*.vue",
     "src/shared/**/*",
-    "src/preload/index.d.ts"
+    "src/preload/index.d.ts",
+    // Tests live here rather than in tsconfig.node.json because the grid specs
+    // exercise DOM-typed code (canvas, events) and need the DOM lib. The
+    // main-process specs only touch pure modules, so they typecheck fine too.
+    "tests/**/*"
   ]
 }

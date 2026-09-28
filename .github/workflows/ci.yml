@@ -45,6 +45,14 @@ jobs:
       - name: Smoke (dev CSP)
         run: npm run smoke:dev
 
+      # Reported, not blocking. A 600-frame paint benchmark is CPU-bound, and
+      # shared-runner load varies enough to make a hard p95 gate flaky. The
+      # number is printed so a regression is still visible in the log; run
+      # `npm run bench` locally for the gating assertion.
+      - name: Performance benchmark (reported)
+        run: npm run bench
+        continue-on-error: true
+
       # Reported, not blocking: a transitive advisory in pg's tree should not
       # stall unrelated work. Escalate to blocking once the tree is clean.
       - name: Audit runtime dependencies
