@@ -4,6 +4,26 @@ A desktop PostgreSQL database viewer with a from-scratch, Excel-like canvas data
 
 **Stack:** Electron 44 · Vue 3.5 · Vite 7 · Tailwind 4 · TypeScript 6 · `pg` (the only runtime dependency)
 
+## The story behind this project
+
+This project exists because of a challenge.
+
+My English mentor told me something simple but hard: *"Practice your English often."* Not just
+studying grammar — actually using it, every day, in real situations. So I decided to do something
+that would force me to speak, write, and think in English consistently: I started a YouTube channel
+where I build software from scratch and explain everything along the way.
+
+Tabby is the project for that channel. Every decision, every bug, every "why did I do that" moment
+is documented on video — not polished for a tutorial, but honest and in progress. Building a
+PostgreSQL viewer from scratch (including the data grid, which most people would just grab a library
+for) gives me plenty to talk about: architecture, performance, security, canvas rendering, and the
+kind of problems you only discover when you build something yourself.
+
+If you found your way here from a video, welcome — this codebase is yours to explore, fork, and
+learn from.
+
+🎬 **Watch the introduction:** [The story behind Tabby](https://www.youtube.com/watch?v=S7wPbXX_Mhw&t=198s)
+
 ## Documentation
 
 | Document                                       | Contents                                                                                                 |
