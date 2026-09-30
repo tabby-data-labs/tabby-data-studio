@@ -129,7 +129,7 @@ The stated goal is a minimal third-party surface. Make that a **measurable invar
 
 Editing data (INSERT/UPDATE/DELETE through the grid), DDL execution, schema diffing, ERD diagrams, other database engines, cloud sync, plugins/extensions, auto-update, Excel binary export.
 
-**However:** v1 must not make v2 expensive. The interfaces in `docs/ARCHITECTURE.md` §6 are designed so cell editing is _additive_ — a `RowIdentityResolver`, a `ChangeBuffer`, and a mutable `DataSource` variant — rather than a rewrite.
+**However:** v1 must not make v2 expensive. `docs/ARCHITECTURE.md` §6 is a **design sketch** — as of Phase 2 none of it exists in code — and it is written so cell editing stays _additive_ rather than a rewrite: a `RowIdentityResolver`, a `ChangeBuffer`, and a mutable `DataSource` variant. The only editing groundwork actually in place today is `TableMeta.primaryKey` in `src/shared/domain.ts`, which Phase 4 populates from `pg_catalog`; Phase 4 also declares those two interfaces. See Phase 10 for the rest.
 
 ### Non-negotiable product qualities
 
@@ -356,6 +356,7 @@ Delivered as 22 modules / 5,047 lines in `src/renderer/src/grid/`. New in Phase 
 - SSL config with explicit `rejectUnauthorized`; no silent trust
 - Identifier handling: a `quoteIdent` that validates against a safe character class and doubles `"` — never naive concatenation
 - Schema introspection against `pg_catalog` (`pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_description`) with per-connection caching and manual/explicit invalidation
+- **Row-identity groundwork for v2 editing (types only).** This is the moment `pg_constraint`/`pg_index` are already being read, so primary-key and best-unique-index detection is nearly free here and expensive to retrofit later. Deliver `RowIdentityResolver` and `ChangeBuffer` in `src/shared/domain.ts` as _declared types with no implementation_, plus the PK columns already carried on `TableMeta`. Explicitly **not** in scope: any editor, any write path, any change tracking. `default_transaction_read_only` stays on and the Phase 4 exit criterion below still asserts writes fail — the types must not become a backdoor. If by the end of Phase 5 these types have not needed to change, the v1 contract is genuinely editing-ready; if they have, fix them now rather than in Phase 10.
 - **Positionable large results:** `BEGIN` + `DECLARE <name> CURSOR FOR <query>` + `FETCH`/`MOVE ABSOLUTE`, so the grid can jump to row 800,000 without `OFFSET` scanning a million rows
 - `ResultRegistry`: `resultId` → cursor + column metadata; bounded count, TTL, LRU eviction, memory cap
 - `query:cancel` via a **second** connection running `pg_cancel_backend(pid)` — you cannot cancel on the connection that is busy
@@ -418,7 +419,14 @@ Delivered as 22 modules / 5,047 lines in `src/renderer/src/grid/`. New in Phase 
 
 ### Phase 10 — v2 groundwork
 
-- Implement the editing layer against the interfaces stubbed in Phase 4/5: `RowIdentityResolver` (PK/unique detection), `ChangeBuffer` (dirty rows, optimistic concurrency), staged-changes review + commit UI
+> **Status check before starting:** as of Phase 2 completion there is **no editing code anywhere** —
+> a grep of `src/**/*.ts` for `RowIdentityResolver|ChangeBuffer|RowKey|beginEdit|commitEdit|setCell|editable`
+> returns zero matches. `ARCHITECTURE.md` §6 is _design only_. Phase 4 now carries the explicit
+> line item to declare those two types; everything beyond declarations lands here.
+
+- Implement the editing layer against the types declared in Phase 4: `RowIdentityResolver` (PK/unique detection), `ChangeBuffer` (dirty rows, optimistic concurrency), staged-changes review + commit UI
+- Grid side, all additive: a mutable `DataSource` variant with a write method, an `editable`/`readOnly` flag on `ColumnSpec`, `beginEdit`/`commitEdit`/`cancelEdit` on `SelectionEvent`, and a real editor on the existing `overlay` layer (today that layer only draws the column-resize guide)
+- Lift `default_transaction_read_only` per-transaction rather than per-connection, so a failed write cannot leave the session writable
 - Second driver behind the `Driver` interface (MySQL or SQLite) to prove the abstraction is real and not Postgres-shaped by accident
 
 ---

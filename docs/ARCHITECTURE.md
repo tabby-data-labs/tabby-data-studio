@@ -235,20 +235,59 @@ Capture `pg_backend_pid()` when a query starts, store it against the `resultId`,
 
 ---
 
-## 6. Designed-in for v2 editing (interfaces only in v1)
+## 6. Designed-in for v2 editing (design only — nothing implemented)
+
+> **Accuracy note.** This section is a _design sketch_, not a description of current code. As of
+> Phase 2 completion, `src/**/*.ts` contains **no** `RowIdentityResolver`, `ChangeBuffer`, `RowKey`,
+> `Change`, editor, or write path — grep returns zero matches. An earlier revision of this document
+> claimed these existed "as types with a no-op implementation"; that was wrong and has been
+> corrected. `PLAN.md` Phase 4 now carries the explicit line item to declare the two interfaces, and
+> Phase 10 implements everything beyond the declarations.
 
 ```ts
+// Row identity: which columns uniquely pin a row, so an UPDATE can target it.
+type RowKey = readonly { readonly column: string; readonly value: CellValue }[];
+
 interface RowIdentityResolver {
-  resolve(table: TableMeta): RowKey | null; // PK or best unique index
+  /** Primary key if there is one, else the best unique NOT NULL index, else null. */
+  resolve(table: TableMeta): readonly string[] | null;
+  keyOf(table: TableMeta, row: RowBlock, offset: number): RowKey | null;
 }
+
+// Staged edits, held in the renderer, flushed as parameterised SQL built in MAIN.
+interface Change {
+  readonly column: string;
+  readonly before: CellValue; // for the optimistic-concurrency WHERE clause
+  readonly after: CellValue;
+}
+
 interface ChangeBuffer {
   set(resultId: string, row: RowKey, col: string, next: CellValue): void;
-  changesFor(row: RowKey): Change[];
-  toSql(): { text: string; values: unknown[] }[]; // built in MAIN, parameterised
+  revert(resultId: string, row: RowKey, col?: string): void;
+  changesFor(row: RowKey): readonly Change[];
+  /** Built in the main process only, always parameterised. */
+  toSql(): readonly { text: string; values: readonly unknown[] }[];
 }
 ```
 
-In v1 these exist as types with a no-op implementation so the grid, codec, and IPC contract do not need reshaping later. Editing additionally requires dropping `default_transaction_read_only` per-transaction and an optimistic-concurrency check (`WHERE pk = $1 AND col IS NOT DISTINCT FROM $2`).
+Two things this design commits to, because they are hard to retrofit:
+
+1. **`TableMeta.primaryKey` already exists** (`src/shared/domain.ts`) and Phase 4 fills it from
+   `pg_constraint`/`pg_index`. That is the only piece of editing groundwork genuinely in place today,
+   and it is why the type declarations belong in Phase 4 rather than Phase 10 — the metadata is
+   already being read there.
+2. **A table with no usable unique index is not editable.** `resolve()` returns null and the grid must
+   render those columns read-only rather than guessing with a full-row `WHERE`. Silent
+   multi-row updates are the worst failure mode an editing UI can have.
+
+Editing additionally requires dropping `default_transaction_read_only` **per-transaction** (never
+per-connection, so a failed write cannot leave the session writable) and an optimistic-concurrency
+check (`WHERE pk = $1 AND col IS NOT DISTINCT FROM $2`).
+
+On the grid side the additions are all additive, which is the point of the `DataSource` boundary:
+a mutable `DataSource` variant with a write method, an `editable`/`readOnly` flag on `ColumnSpec`,
+`beginEdit`/`commitEdit`/`cancelEdit` on `SelectionEvent`, and a real editor mounted on the existing
+`overlay` canvas layer — which today only draws the column-resize guide.
 
 ---
 

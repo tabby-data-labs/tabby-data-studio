@@ -21,7 +21,13 @@ Phases 1–2 in the plan implement §3–§9. §12 is the API the rest of the ap
 
 ### Non-goals (v1)
 
-Cell editing (overlay layer is built, editor is stubbed), variable row heights, cell merging, formulas, pivot, charts, RTL layout (design must not preclude it).
+Cell editing, variable row heights, cell merging, formulas, pivot, charts, RTL layout (design must not preclude it).
+
+On editing specifically: the `overlay` canvas layer **is** built and positioned for an editor, but
+today it draws only the column-resize guide — there is **no editor stub**, and `DataSource` has no
+write method. Everything editing needs is listed in `PLAN.md` Phase 10 and `ARCHITECTURE.md` §6.
+What v1 does provide is the hook an editor will target: `SelectionState.active`, documented as "the
+cell an editor or inspector would target", and already consumed by the Cell Inspector.
 
 ---
 
@@ -271,7 +277,22 @@ Serialise the **union** of selected ranges to a rectangular block:
 - Escaping: a cell containing `\t`, `\n`, or `"` is double-quoted with internal quotes doubled. `NULL` copies as empty by default, configurable to the literal `NULL`.
 - Also offer **CSV** (RFC 4180), **JSON** (array of objects), **SQL `INSERT`**, and **Markdown table**.
 - Above ~100k cells: show a confirmation with the count, run serialisation off the main render path (chunked across frames or in a Worker), and display progress with cancel.
-- Paste is stubbed in v1 (read-only) but the parser should be written now — it is the inverse of the serialiser and will be needed in v2.
+
+**Implemented in Phase 2** as `grid/clipboard.ts`: all five formats, `escapeDelimited` (RFC 4180
+quoting for any delimiter), `serialiseChunks` as a lazy generator so `concat(chunks) === serialise()`
+and a huge range can be streamed without one giant string, plus progress/cancel wiring in the grid.
+JSON keeps a number a number only when `raw` round-trips through a double exactly, and emits the
+string otherwise — silently rounding an int8 would be a lie about the data.
+
+**Paste is not implemented at all** — no parser, no stub. (An earlier revision of this document said
+paste was "stubbed in v1"; it never was.) It belongs with editing in Phase 10, since a paste target
+is meaningless in a read-only grid. The parser is the exact inverse of `escapeDelimited`, so writing
+it then is cheap: quoted-field state machine, `""` → `"`, delimiter/newline splitting.
+
+One harness limitation worth knowing: Chromium requires **transient user activation** to write the
+clipboard, and a synthetic `dispatchEvent` is untrusted, so `npm run smoke` cannot assert on the real
+system clipboard. It asserts the intercepted `writeText` payload instead, which is stronger evidence
+about serialisation anyway.
 
 ---
 
