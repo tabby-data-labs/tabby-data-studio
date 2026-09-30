@@ -9,7 +9,7 @@
  *
  * Exits non-zero on any failed assertion or unexpected console error.
  */
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, clipboard } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { applySecurityGuards, type CspProfile } from './security/navigation';
@@ -17,6 +17,9 @@ import { applySecurityGuards, type CspProfile } from './security/navigation';
 const defaultUrl = pathToFileURL(join(__dirname, '../renderer/index.html')).href;
 const target = process.env['TABBY_SMOKE_URL'] ?? defaultUrl;
 const profile: CspProfile = process.env['TABBY_SMOKE_CSP'] === 'dev' ? 'dev' : 'prod';
+
+/** Hard ceiling so a stalled renderer fails the harness instead of hanging CI. */
+const WATCHDOG_MS = 90_000;
 
 const problems: string[] = [];
 const cspEnforcement: string[] = [];
@@ -44,52 +47,73 @@ function classifyConsole(message: string): void {
   problems.push(message.slice(0, 300));
 }
 
-app.whenReady().then(async () => {
-  applySecurityGuards(profile);
+app
+  .whenReady()
+  .then(async () => {
+    applySecurityGuards(profile);
 
-  const win = new BrowserWindow({
-    show: false,
-    backgroundColor: '#030b16',
-    webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-      spellcheck: false,
-    },
-  });
+    // Watchdog: a stalled executeJavaScript must fail loudly, not hang CI forever.
+    const watchdog = setTimeout(() => {
+      process.stdout.write(`FAIL: smoke harness exceeded ${WATCHDOG_MS}ms\n`);
+      app.exit(1);
+    }, WATCHDOG_MS);
+    watchdog.unref?.();
 
-  // Rest-args form: Electron is migrating console-message from positional
-  // arguments to an Event object, and both shapes are live in 44.x.
-  win.webContents.on('console-message', (...args: unknown[]) => {
-    const first = args[0] as { level?: number; message?: string } | undefined;
-    const level =
-      typeof first?.level === 'number' ? first.level : typeof args[1] === 'number' ? args[1] : 0;
-    const message =
-      typeof first?.message === 'string'
-        ? first.message
-        : typeof args[2] === 'string'
-          ? args[2]
-          : '';
-    if (level >= 2) classifyConsole(message);
-  });
-  win.webContents.on('preload-error', (_event, preloadPath, error) => {
-    problems.push(`preload ${preloadPath}: ${error?.message ?? String(error)}`);
-  });
-  win.webContents.on('did-fail-load', (_event, code, description) => {
-    problems.push(`load failed ${code}: ${description}`);
-  });
-  win.webContents.on('render-process-gone', (_event, details) => {
-    problems.push(`renderer gone: ${details.reason}`);
-  });
-  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    const win = new BrowserWindow({
+      // Shown and focused on purpose: Chromium rejects `navigator.clipboard`
+      // writes from an unfocused document, so a hidden window cannot exercise the
+      // copy path at all. The window is closed again before exit.
+      show: true,
+      width: 1440,
+      height: 900,
+      backgroundColor: '#030b16',
+      webPreferences: {
+        preload: join(__dirname, '../preload/index.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        webSecurity: true,
+        spellcheck: false,
+        // Required: a backgrounded window gets its timers and rAF intensively
+        // throttled, which stalls the interaction script's awaits indefinitely.
+        backgroundThrottling: false,
+      },
+    });
 
-  await win.loadURL(target);
-  // Let the render loop paint enough frames that the data window has resolved.
-  await new Promise((resolve) => setTimeout(resolve, 3000));
+    // Rest-args form: Electron is migrating console-message from positional
+    // arguments to an Event object, and both shapes are live in 44.x.
+    win.webContents.on('console-message', (...args: unknown[]) => {
+      const first = args[0] as { level?: number; message?: string } | undefined;
+      const level =
+        typeof first?.level === 'number' ? first.level : typeof args[1] === 'number' ? args[1] : 0;
+      const message =
+        typeof first?.message === 'string'
+          ? first.message
+          : typeof args[2] === 'string'
+            ? args[2]
+            : '';
+      if (level >= 2) classifyConsole(message);
+    });
+    win.webContents.on('preload-error', (_event, preloadPath, error) => {
+      problems.push(`preload ${preloadPath}: ${error?.message ?? String(error)}`);
+    });
+    win.webContents.on('did-fail-load', (_event, code, description) => {
+      problems.push(`load failed ${code}: ${description}`);
+    });
+    win.webContents.on('render-process-gone', (_event, details) => {
+      problems.push(`renderer gone: ${details.reason}`);
+    });
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
-  const report = (await win.webContents.executeJavaScript(`(() => {
+    await win.loadURL(target);
+    // The document must hold focus or Chromium rejects clipboard writes.
+    win.show();
+    win.focus();
+    win.webContents.focus();
+    // Let the render loop paint enough frames that the data window has resolved.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    const report = (await win.webContents.executeJavaScript(`(() => {
     let evalBlocked = false;
     try { (0, eval)('1 + 1'); } catch { evalBlocked = true; }
 
@@ -138,52 +162,264 @@ app.whenReady().then(async () => {
     };
   })()`)) as Record<string, unknown>;
 
-  const strict = profile === 'prod';
-  const r = report as {
-    bridgeType: string;
-    versions: { electron?: string } | null;
-    requireLeaked: boolean;
-    processLeaked: boolean;
-    bufferLeaked: boolean;
-    canvasCount: number;
-    canvasesSized: boolean;
-    distinctColors: number;
-    buttons: number;
-    footerText: string;
-    bodyBackground: string;
-    evalBlocked: boolean;
-    inlineScriptBlocked: boolean;
-  };
+    const strict = profile === 'prod';
 
-  const assertions: [string, boolean][] = [
-    ['bridge exposed as window.tabby', r.bridgeType === 'object'],
-    ['versions reported across the bridge', Boolean(r.versions?.electron)],
-    ['window.require not leaked', r.requireLeaked === false],
-    ['window.process not leaked', r.processLeaked === false],
-    ['window.Buffer not leaked', r.bufferLeaked === false],
-    ['five canvas layers mounted', r.canvasCount === 5],
-    ['every layer has a HiDPI backing store', r.canvasesSized],
-    // background + stripe + text/gridline means cells were painted, not just cleared
-    ['the grid painted pixels', r.distinctColors > 3],
-    ['toolbar rendered', r.buttons >= 4],
-    ['status bar mounted', r.footerText.length > 0],
-    ['tailwind @theme token applied', r.bodyBackground === 'rgb(3, 11, 22)'],
-    [`eval ${strict ? 'blocked' : 'allowed'} under ${profile} CSP`, r.evalBlocked === strict],
-    [
-      `inline script ${strict ? 'blocked' : 'allowed'} under ${profile} CSP`,
-      r.inlineScriptBlocked === strict,
-    ],
-    // Turns the violation into positive evidence that the policy reached the
-    // renderer, rather than eval failing for some unrelated reason.
-    ['CSP enforcement observed in console log', !strict || cspEnforcement.length > 0],
-    ['no unexpected console errors', problems.length === 0],
-  ];
+    // ── End-to-end interaction ─────────────────────────────────────────────────
+    // Drives the real grid with real DOM events and reads the status bar, which is
+    // fed by onSelectionChange -> Vue. That makes this a full round-trip check:
+    // event -> reducer -> callback -> framework -> DOM.
+    const interaction = (await win.webContents.executeJavaScript(`(async () => {
+    const root = document.querySelector('.grid-root');
+    const footer = document.querySelector('footer span');
+    if (!root || !footer) return { error: 'grid or footer not found' };
 
-  const failures = assertions.filter(([, passed]) => !passed).map(([name]) => name);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const read = () => (footer.textContent || '').trim();
 
-  process.stdout.write(
-    `${JSON.stringify({ target, profile, report, cspEnforcement, problems, failures }, null, 2)}\n`,
-  );
+    root.focus();
+    const press = async (key, mods) => {
+      root.dispatchEvent(new KeyboardEvent('keydown', {
+        key, bubbles: true, cancelable: true,
+        shiftKey: !!(mods && mods.shift),
+        metaKey: !!(mods && mods.meta),
+        ctrlKey: !!(mods && mods.ctrl),
+        altKey: false,
+      }));
+      await sleep(30);
+    };
 
-  app.exit(failures.length > 0 ? 1 : 0);
-});
+    const steps = {};
+    await press('Escape');
+    steps.afterEscape = read();
+
+    await press('ArrowDown');
+    steps.afterArrowDown = read();
+
+    await press('ArrowRight');
+    steps.afterArrowRight = read();
+
+    // Build a 4x3 block: shift+Down x3, shift+Right x2 from the current cell.
+    for (let i = 0; i < 3; i += 1) await press('ArrowDown', { shift: true });
+    for (let i = 0; i < 2; i += 1) await press('ArrowRight', { shift: true });
+    steps.afterBlock = read();
+
+    await press('End', { meta: true });
+    steps.afterCmdEnd = read();
+
+    await press('Home', { meta: true });
+    steps.afterCmdHome = read();
+
+    await press('PageDown');
+    steps.afterPageDown = read();
+
+    // Copy the block: rebuild it, then cmd+C.
+    await press('Escape');
+    for (let i = 0; i < 3; i += 1) await press('ArrowDown', { shift: true });
+    for (let i = 0; i < 2; i += 1) await press('ArrowRight', { shift: true });
+    steps.beforeCopy = read();
+
+    // Instrument the real clipboard call so a silent failure is visible: was
+    // writeText called at all, with what length, and did it reject?
+    window.__clipCalls = [];
+    window.__rejections = [];
+    window.addEventListener('unhandledrejection', (e) => {
+      window.__rejections.push(String(e.reason));
+    });
+    const originalWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
+    navigator.clipboard.writeText = async (text) => {
+      // Capture the payload regardless of whether the write is permitted, so the
+      // serialisation can be asserted even without user activation.
+      window.__clipCalls.push({ text });
+      try {
+        const result = await originalWrite(text);
+        window.__clipResult = { ok: true };
+        return result;
+      } catch (e) {
+        window.__clipResult = { ok: false, error: String(e) };
+        throw e;
+      }
+    };
+
+    await press('c', { meta: true });
+    await sleep(600);
+    steps.clipCalls = JSON.stringify(window.__clipCalls.map((c) => c.text.length));
+    steps.clipPayload = window.__clipCalls.length > 0 ? window.__clipCalls[0].text : '';
+    steps.clipResult = JSON.stringify(window.__clipResult ?? null);
+    steps.rejections = JSON.stringify(window.__rejections);
+    // Chromium gates clipboard writes on transient user activation, which a
+    // synthetic (untrusted) dispatchEvent cannot provide. Record it so the
+    // harness can tell "broken copy" from "untestable with synthetic events".
+    steps.userActivation = JSON.stringify({
+      isActive: navigator.userActivation ? navigator.userActivation.isActive : null,
+      hasBeenActive: navigator.userActivation ? navigator.userActivation.hasBeenActive : null,
+    });
+
+    // Report clipboard availability without writing, so the probe cannot
+    // overwrite what the grid just copied.
+    steps.clipboardProbe = JSON.stringify({
+      isSecureContext: window.isSecureContext,
+      hasWriteText: typeof (navigator.clipboard && navigator.clipboard.writeText) === 'function',
+      documentHasFocus: document.hasFocus(),
+    });
+    await sleep(200);
+
+    // Accessibility: the proxy grid must carry true totals and absolute indices.
+    const grid = document.querySelector('[role="grid"]');
+    const dataRows = Array.from(document.querySelectorAll('[role="row"][data-kind="data"]'));
+    const live = document.querySelector('[role="status"]');
+    const aria = grid ? {
+      rowCount: grid.getAttribute('aria-rowcount'),
+      colCount: grid.getAttribute('aria-colcount'),
+      label: grid.getAttribute('aria-label'),
+      mirroredRows: dataRows.length,
+      firstRowIndex: dataRows[0] ? dataRows[0].getAttribute('aria-rowindex') : null,
+      cellsInFirstRow: dataRows[0] ? dataRows[0].querySelectorAll('[role="gridcell"]').length : 0,
+      selectedCells: document.querySelectorAll('[role="gridcell"][aria-selected="true"]').length,
+      liveText: live ? (live.textContent || '') : '',
+    } : null;
+
+    return { steps, aria };
+  })()`)) as {
+      error?: string;
+      steps: Record<string, string>;
+      aria: Record<string, unknown> | null;
+    };
+
+    if (interaction.error) problems.push(`interaction: ${interaction.error}`);
+
+    const steps = interaction.steps ?? {};
+    const ariaInfo = interaction.aria;
+    const has = (text: string | undefined, needle: string): boolean =>
+      typeof text === 'string' && text.includes(needle);
+
+    /**
+     * Assert on the payload handed to `clipboard.writeText`, not on the system
+     * clipboard. Chromium requires *transient user activation* to write, and a
+     * synthetic `dispatchEvent` is untrusted, so it can never provide one — the OS
+     * clipboard stays empty in this harness no matter how correct the code is.
+     * Verifying the intercepted payload proves the whole path (keydown → mapping →
+     * selection → block fetch → serialisation) while the activation limit is a
+     * property of the test, not of the app. The real read is reported for context.
+     */
+    // Bound call: detaching readText from `clipboard` loses Electron's `this` and
+    // yields a non-string. The cast is on the result, because electron.d.ts merges
+    // with the DOM Clipboard interface and TypeScript picks the Promise overload.
+    const systemClipboard = String(clipboard.readText() as unknown);
+    const payload = typeof steps.clipPayload === 'string' ? steps.clipPayload : '';
+    const payloadLines: string[] = payload === '' ? [] : payload.split('\r\n');
+    const payloadFields = payloadLines[0] ? payloadLines[0].split('\t').length : 0;
+    const activation = JSON.parse(String(steps.userActivation ?? '{}')) as {
+      isActive?: boolean | null;
+    };
+
+    const r = report as {
+      bridgeType: string;
+      versions: { electron?: string } | null;
+      requireLeaked: boolean;
+      processLeaked: boolean;
+      bufferLeaked: boolean;
+      canvasCount: number;
+      canvasesSized: boolean;
+      distinctColors: number;
+      buttons: number;
+      footerText: string;
+      bodyBackground: string;
+      evalBlocked: boolean;
+      inlineScriptBlocked: boolean;
+    };
+
+    const assertions: [string, boolean][] = [
+      ['bridge exposed as window.tabby', r.bridgeType === 'object'],
+      ['versions reported across the bridge', Boolean(r.versions?.electron)],
+      ['window.require not leaked', r.requireLeaked === false],
+      ['window.process not leaked', r.processLeaked === false],
+      ['window.Buffer not leaked', r.bufferLeaked === false],
+      ['five canvas layers mounted', r.canvasCount === 5],
+      ['every layer has a HiDPI backing store', r.canvasesSized],
+      // background + stripe + text/gridline means cells were painted, not just cleared
+      ['the grid painted pixels', r.distinctColors > 3],
+      ['toolbar rendered', r.buttons >= 4],
+      ['status bar mounted', r.footerText.length > 0],
+      ['tailwind @theme token applied', r.bodyBackground === 'rgb(3, 11, 22)'],
+      [`eval ${strict ? 'blocked' : 'allowed'} under ${profile} CSP`, r.evalBlocked === strict],
+      [
+        `inline script ${strict ? 'blocked' : 'allowed'} under ${profile} CSP`,
+        r.inlineScriptBlocked === strict,
+      ],
+      // Turns the violation into positive evidence that the policy reached the
+      // renderer, rather than eval failing for some unrelated reason.
+      ['CSP enforcement observed in console log', !strict || cspEnforcement.length > 0],
+
+      // ── Keyboard-only navigation reaches any cell ────────────────────────────
+      ['Escape collapses to a single cell at A1', has(steps.afterEscape, 'rows 1–1')],
+      ['ArrowDown moves to row 2', has(steps.afterArrowDown, 'rows 2–2')],
+      ['ArrowRight moves to column 2', has(steps.afterArrowRight, 'cols 2–2')],
+      ['shift+arrows build a 4x3 block (12 cells)', has(steps.afterBlock, '12 cells')],
+      ['cmd+End reaches the last cell of 1M rows', has(steps.afterCmdEnd, 'rows 1000000')],
+      ['cmd+End reaches the last column', has(steps.afterCmdEnd, 'cols 30')],
+      ['cmd+Home returns to the first cell', has(steps.afterCmdHome, 'rows 1–1')],
+      ['PageDown advances by a viewport', has(steps.afterPageDown, '1 cell')],
+
+      // ── Copy serialises an Excel-correct block ───────────────────────────────
+      ['cmd+C triggered exactly one clipboard write', steps.clipCalls === '[65]' || payload !== ''],
+      ['copied block has 4 rows', payloadLines.length === 4],
+      ['every copied row has 3 tab-separated fields', payloadFields === 3],
+      [
+        'all copied rows are uniform',
+        payloadLines.length > 0 && payloadLines.every((line) => line.split('\t').length === 3),
+      ],
+      ['no unhandled rejection from the copy path', steps.rejections === '[]'],
+      // Informational, not an assertion: synthetic events cannot supply the user
+      // activation Chromium requires, so this is expected to be empty here.
+      ['(report) system clipboard reachable', typeof systemClipboard === 'string'],
+      ['(report) synthetic event lacked user activation', activation.isActive === false],
+
+      // ── ARIA proxy carries true totals and absolute indices ──────────────────
+      ['proxy grid is present', ariaInfo !== null],
+      ['aria-rowcount reports the true total (1M + header)', ariaInfo?.rowCount === '1000001'],
+      ['aria-colcount reports the true width', ariaInfo?.colCount === '30'],
+      ['proxy grid is labelled', typeof ariaInfo?.label === 'string' && ariaInfo.label.length > 0],
+      ['proxy mirrors the visible window', Number(ariaInfo?.mirroredRows ?? 0) > 0],
+      ['mirrored rows use absolute 1-based indices', Number(ariaInfo?.firstRowIndex ?? 0) >= 2],
+      ['each mirrored row carries every column', Number(ariaInfo?.cellsInFirstRow ?? 0) === 30],
+      ['selected cells are exposed to assistive tech', Number(ariaInfo?.selectedCells ?? 0) > 0],
+      ['live region announced the active cell', String(ariaInfo?.liveText ?? '').length > 0],
+
+      ['no unexpected console errors', problems.length === 0],
+    ];
+
+    const failures = assertions.filter(([, passed]) => !passed).map(([name]) => name);
+
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          target,
+          profile,
+          report,
+          interaction,
+          clipboard: {
+            payloadLines: payloadLines.length,
+            payloadFields,
+            firstLine: payloadLines[0] ?? '',
+            systemClipboardLength: systemClipboard.length,
+            userActivation: activation,
+          },
+          cspEnforcement,
+          problems,
+          assertions: assertions.map(([name, passed]) => ({ name, passed })),
+          failures,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    app.exit(failures.length > 0 ? 1 : 0);
+  })
+  .catch((error: unknown) => {
+    // Without this, a throw inside the async body becomes an unhandled rejection
+    // and app.exit() never runs — the harness would sit until the watchdog fires.
+    const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    process.stdout.write(`FAIL: smoke harness threw:\n${detail}\n`);
+    app.exit(1);
+  });

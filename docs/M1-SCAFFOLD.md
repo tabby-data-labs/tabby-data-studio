@@ -582,12 +582,26 @@ but confirming text stays crisp requires a second display and a human eye.
 up, so that number is unmeasured. The 35 layout specs were written to cover every branch by
 construction, but that is an assertion about intent, not a measurement.
 
-### Deferred to Phase 2
+### Phase 2 — ✅ complete (2026-09-27)
 
-- [ ] Keyboard navigation (arrows, Page Up/Down, Home/End, Tab/Enter)
-- [ ] Clipboard beyond TSV: CSV, JSON, SQL `INSERT`, Markdown
-- [ ] Context menu, cell tooltip, Cell Inspector
-- [ ] ARIA proxy grid — only a live region announcing the selection exists today
+Delivered on top of the Phase 1 grid; see [`PLAN.md` §6 Phase 2](../PLAN.md) for the full result
+table, the four findings, and the caveats.
+
+- [x] Keyboard navigation: arrows, shift+arrows, cmd+arrows (blank-aware data edge), Page Up/Down,
+      Home/End, cmd+Home/End, Tab/Shift+Tab with row wrapping, Enter/Shift+Enter, Esc — 44 tests over
+      the modifier/platform matrix, then verified end-to-end in real Electron
+- [x] Clipboard: TSV, CSV (RFC 4180), JSON, SQL `INSERT`, Markdown — with lazy chunking, a progress
+      callback, cancellation, and a 100k-cell confirmation threshold
+- [x] Context menu: copy-as-…, inspect, sort, freeze, hide column, select all — keyboard navigable
+- [x] Cell tooltip on hover; Cell Inspector slide-over with the full untruncated value, UTC + local
+      timestamps, bytea hex, pretty-printed JSON, and an explicit warning when an int8 exceeds double
+      precision
+- [x] Type-aware rendering: NULL italic-grey, numbers right-aligned, booleans centred
+- [x] ARIA proxy grid with pooled DOM nodes, on a timer decoupled from the paint loop
+- [x] 442 tests across 19 files; smoke harness at 39/39 assertions on both CSP profiles
+
+**Still needs a human:** a real VoiceOver pass over the ARIA proxy, and dragging the window to a
+different-DPI monitor.
 
 ### Deferred to Phase 9
 

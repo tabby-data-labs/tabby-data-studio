@@ -248,6 +248,62 @@ describe('paintBody placeholders', () => {
   });
 });
 
+describe('type-aware styling', () => {
+  /** One column of cells, so the assertions stay readable. */
+  function singleColumn(cells: readonly CellValue[]): BlockCache {
+    const cache = new BlockCache({ blockSize: 200 });
+    cache.put({ startRow: 0, rowCount: cells.length, columns: [cells] });
+    return cache;
+  }
+
+  it('renders NULL in an italic font and the muted colour', () => {
+    const cache = singleColumn([TEXT('a'), { kind: 'null' }, TEXT('b')]);
+    const { input, calls } = makeInput({ rowCount: 3, cache });
+    paintBody(input);
+
+    const fonts = calls.filter((c) => c.method === 'set:font').map((c) => String(c.args[0]));
+    expect(fonts).toContain(`italic ${THEME.cellFont}`);
+    expect(fonts).toContain(THEME.cellFont);
+
+    const fills = calls.filter((c) => c.method === 'set:fillStyle').map((c) => String(c.args[0]));
+    expect(fills).toContain(THEME.muted);
+    expect(fills).toContain(THEME.text);
+  });
+
+  it('does not reassign the font when consecutive cells share a style', () => {
+    const cache = singleColumn([TEXT('a'), TEXT('b'), TEXT('c')]);
+    const { input, calls } = makeInput({ rowCount: 3, cache });
+    paintBody(input);
+
+    // One assignment establishes the cell font; there is no per-cell churn.
+    const fontSets = calls.filter((c) => c.method === 'set:font' && c.args[0] === THEME.cellFont);
+    expect(fontSets).toHaveLength(1);
+  });
+
+  it('right-aligns numbers, centres booleans, left-aligns text', () => {
+    const cache = singleColumn([
+      { kind: 'number', value: 42, raw: '42' },
+      { kind: 'bool', value: true },
+      TEXT('left'),
+    ]);
+    const { input, calls } = makeInput({ rowCount: 3, cache });
+    paintBody(input);
+
+    const aligns = calls.filter((c) => c.method === 'set:textAlign').map((c) => c.args[0]);
+    expect(aligns).toContain('right');
+    expect(aligns).toContain('center');
+    expect(aligns).toContain('left');
+  });
+
+  it('draws a skeleton bar, never a value, for an unloaded cell', () => {
+    const cache = new BlockCache({ blockSize: 200 });
+    const { input, calls } = makeInput({ rowCount: 5, cache });
+    paintBody(input);
+    expect(countCalls(calls, 'fillText')).toBe(0);
+    expect(countCalls(calls, 'fillRect')).toBeGreaterThan(0);
+  });
+});
+
 describe('paintColHeader', () => {
   it('draws the column name and, when tall enough, its type', () => {
     const { input, calls } = makeInput({});

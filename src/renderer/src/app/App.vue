@@ -3,6 +3,7 @@ import { computed, onMounted, ref, shallowRef } from 'vue';
 import DataGridVue from '@/components/DataGridVue.vue';
 import { runScrollBench, type BenchResult } from '@/grid/bench';
 import type { DataGrid } from '@/grid/create-data-grid';
+import type { ClipboardFormat } from '@/grid/clipboard';
 import { FakeDataSource } from '@/grid/fake-source';
 import { boundingBox, selectedCellCount } from '@/grid/selection';
 import type { SelectionState, SortSpec } from '@/grid/types';
@@ -23,6 +24,8 @@ const bench = ref<BenchResult | null>(null);
 const benching = ref(false);
 const sort = ref<SortSpec | null>(null);
 const notice = ref<string | null>(null);
+const copying = ref<ClipboardFormat | null>(null);
+const copyProgress = ref(0);
 const versions = ref<{ electron: string; chrome: string; node: string } | null>(null);
 
 onMounted(() => {
@@ -67,13 +70,51 @@ async function onBench(): Promise<void> {
   }
 }
 
-async function onCopy(): Promise<void> {
+const COPY_FORMATS = ['tsv', 'csv', 'json', 'sql', 'markdown'] as const;
+/** Above this many cells, confirm first: serialising is not free. */
+const COPY_CONFIRM_CELLS = 100_000;
+
+async function onCopy(format: ClipboardFormat): Promise<void> {
   if (!grid.value) return;
+
+  const cells = grid.value.selectedCellCount();
+  if (cells === 0) {
+    notice.value = 'Nothing selected';
+    return;
+  }
+  if (cells > COPY_CONFIRM_CELLS) {
+    const ok = window.confirm(
+      `Copy ${cells.toLocaleString()} cells as ${format.toUpperCase()}? This may take a moment.`,
+    );
+    if (!ok) return;
+  }
+
+  copying.value = format;
+  notice.value = null;
   try {
-    await grid.value.copy();
-    notice.value = 'Copied as TSV';
-  } catch {
-    notice.value = 'Copy failed — clipboard unavailable';
+    const text = await grid.value.copy({
+      format,
+      includeHeader: format === 'csv' || format === 'markdown',
+      table: 'public.exported',
+      onProgress: (done, total) => {
+        copyProgress.value = total > 0 ? done / total : 0;
+      },
+    });
+    const lines = text.split('\n').length;
+    // Distinguish "copied" from "serialised but the clipboard refused", which is
+    // a real possibility in a packaged file:// renderer.
+    const copyError = grid.value.lastCopyError();
+    notice.value = copyError
+      ? `Serialised ${cells.toLocaleString()} cells but the clipboard refused: ${copyError}`
+      : `Copied ${cells.toLocaleString()} cells as ${format.toUpperCase()} (${lines.toLocaleString()} lines)`;
+  } catch (error) {
+    notice.value =
+      error instanceof Error && error.message.includes('cancelled')
+        ? 'Copy cancelled'
+        : 'Copy failed — clipboard unavailable';
+  } finally {
+    copying.value = null;
+    copyProgress.value = 0;
   }
 }
 
@@ -119,7 +160,21 @@ function onGoToRow(): void {
       <button type="button" class="btn" :disabled="benching" @click="onBench">
         {{ benching ? 'Benching…' : 'Run 600-frame bench' }}
       </button>
-      <button type="button" class="btn" @click="onCopy">Copy TSV</button>
+
+      <span class="flex items-center gap-1">
+        <span class="text-muted">Copy</span>
+        <button
+          v-for="format in COPY_FORMATS"
+          :key="format"
+          type="button"
+          class="btn"
+          :disabled="copying !== null"
+          @click="onCopy(format)"
+        >
+          {{ copying === format ? `${Math.round(copyProgress * 100)}%` : format.toUpperCase() }}
+        </button>
+      </span>
+
       <button type="button" class="btn" @click="onToggleSort">
         Sort col 2: {{ sort ? sort.direction : 'off' }}
       </button>
@@ -168,8 +223,8 @@ function onGoToRow(): void {
     >
       <span>{{ selectionSummary }}</span>
       <span class="ml-auto">
-        drag to select · shift-click to extend · drag a column border to resize · double-click to
-        auto-fit
+        arrows / shift+arrows · cmd+arrows to data edge · Page Up/Down · Home/End · cmd+Home/End ·
+        Tab · Esc · right-click for the menu · double-click a cell to inspect
       </span>
     </footer>
 

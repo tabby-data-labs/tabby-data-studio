@@ -15,26 +15,31 @@ A desktop PostgreSQL database viewer with a from-scratch, Excel-like canvas data
 
 ## Status
 
-**Phase 0 and Phase 1 complete** — a hardened Electron shell plus a from-scratch canvas data grid
-scrolling **1,000,000 rows × 30 columns at a measured 60fps**, with no database code involved.
-Phase 2 (Excel-grade interaction) is next.
+**Phases 0–2 complete** — a hardened Electron shell plus a from-scratch canvas data grid that
+scrolls **1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel: pointer and
+keyboard selection, five clipboard formats, context menu, cell inspector, and an ARIA proxy grid.
+No database code yet — Phase 3 starts the IPC and `pg` layer.
 
-| Check                         | Result                                                                  |
-| ----------------------------- | ----------------------------------------------------------------------- |
-| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                      |
-| `npm run lint`                | ✅ 0 errors, 0 warnings                                                 |
-| `npm run typecheck`           | ✅ node + web projects                                                  |
-| `npm test`                    | ✅ **239 tests**, 14 files                                              |
-| `npm run build`               | ✅ main · preload · renderer, all three bundles                         |
-| `npm run smoke` (prod CSP)    | ✅ 16 assertions — grid paints, `eval` and inline scripts **blocked**   |
-| `npm run smoke:dev` (dev CSP) | ✅ 16 assertions — both correctly **allowed** under the dev policy      |
-| `npm run bench`               | ✅ **p95 paint 3.4ms** vs 10ms budget · **60.0 fps** · 1 dropped in 599 |
+| Check                         | Result                                                                                                           |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                               |
+| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                          |
+| `npm run typecheck`           | ✅ node + web projects                                                                                           |
+| `npm test`                    | ✅ **442 tests**, 19 files                                                                                       |
+| `npm run build`               | ✅ main · preload · renderer, all three bundles                                                                  |
+| `npm run smoke` (prod CSP)    | ✅ **39/39 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav and copy verified end-to-end |
+| `npm run smoke:dev` (dev CSP) | ✅ **39/39** — both correctly **allowed** under the dev policy                                                   |
+| `npm run bench`               | ✅ p50 2.50 · **p95 7.60ms** vs 10ms budget · **60.0 fps** · 1 dropped in 599                                    |
 
 Runtime confirmed as **Electron 44.4.5 / Chromium 152.0.7977.130 / Node 24.21.0**, with no
-`require`, `process`, or `Buffer` leaking into the renderer.
+`require`, `process`, or `Buffer` leaking into the renderer, and a one-entry permission allowlist
+(`clipboard-sanitized-write`) that denies everything else outright.
 
-The grid is 15 modules / ~3,200 lines in `src/renderer/src/grid/`, importing nothing from the app —
+The grid is 22 modules / ~5,000 lines in `src/renderer/src/grid/`, importing nothing from the app —
 enforced by an ESLint boundary rule so it stays headlessly testable and extractable.
+
+**Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy, and text crispness when
+dragging to a different-DPI monitor. Both are asserted structurally in code but need eyes.
 
 ## Getting started
 

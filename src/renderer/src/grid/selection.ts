@@ -1,10 +1,20 @@
-import type { CellRef, SelRange, SelectionBounds, SelectionEvent, SelectionState } from './types';
+import type {
+  CellRef,
+  MoveDirection,
+  SelRange,
+  SelectionBounds,
+  SelectionEvent,
+  SelectionState,
+} from './types';
 
 export const EMPTY_SELECTION: SelectionState = {
   ranges: [],
   mode: 'cell',
   active: { row: 0, col: 0 },
 };
+
+/** Used when the caller does not report a viewport height in rows. */
+const DEFAULT_PAGE_ROWS = 20;
 
 function clamp(value: number, low: number, high: number): number {
   return value < low ? low : value > high ? high : value;
@@ -106,12 +116,115 @@ function withPrimary(
   return { ranges, mode, active };
 }
 
+function delta(direction: MoveDirection): { readonly dr: number; readonly dc: number } {
+  switch (direction) {
+    case 'up':
+      return { dr: -1, dc: 0 };
+    case 'down':
+      return { dr: 1, dc: 0 };
+    case 'left':
+      return { dr: 0, dc: -1 };
+    case 'right':
+      return { dr: 0, dc: 1 };
+  }
+}
+
+/** The sheet edge in a direction, ignoring data. */
+function extentEdge(from: CellRef, direction: MoveDirection, bounds: SelectionBounds): CellRef {
+  const { dr, dc } = delta(direction);
+  return {
+    row: dr === 0 ? from.row : dr > 0 ? bounds.rowCount - 1 : 0,
+    col: dc === 0 ? from.col : dc > 0 ? bounds.colCount - 1 : 0,
+  };
+}
+
+/**
+ * Excel's cmd/ctrl+arrow: from a non-blank cell, stop at the last non-blank
+ * before a gap; from a blank cell, jump across the gap to the next non-blank,
+ * or to the sheet edge if there is none.
+ */
+function dataEdge(from: CellRef, direction: MoveDirection, bounds: SelectionBounds): CellRef {
+  const isBlank = bounds.isBlank;
+  if (!isBlank) return extentEdge(from, direction, bounds);
+
+  const { dr, dc } = delta(direction);
+  const maxRow = bounds.rowCount - 1;
+  const maxCol = bounds.colCount - 1;
+  const inside = (row: number, col: number): boolean =>
+    row >= 0 && row <= maxRow && col >= 0 && col <= maxCol;
+
+  let row = from.row;
+  let col = from.col;
+  let nextRow = row + dr;
+  let nextCol = col + dc;
+  if (!inside(nextRow, nextCol)) return from;
+
+  const startBlank = isBlank(from.row, from.col);
+  // Walk while the next cell matches the starting condition, then stop.
+  while (inside(nextRow, nextCol) && isBlank(nextRow, nextCol) === startBlank) {
+    row = nextRow;
+    col = nextCol;
+    nextRow += dr;
+    nextCol += dc;
+  }
+
+  if (startBlank && inside(nextRow, nextCol)) {
+    // Started in a gap: land on the first non-blank cell we found.
+    return { row: nextRow, col: nextCol };
+  }
+  return { row, col };
+}
+
+/**
+ * Tab walks rows, wrapping at the last column; arrows deliberately do not wrap.
+ * At the very last cell Tab stops rather than leaving the grid.
+ */
+function tabTarget(from: CellRef, reverse: boolean, bounds: SelectionBounds): CellRef {
+  const maxRow = bounds.rowCount - 1;
+  const maxCol = bounds.colCount - 1;
+  let { row, col } = from;
+
+  if (!reverse) {
+    if (col < maxCol) col += 1;
+    else if (row < maxRow) {
+      col = 0;
+      row += 1;
+    }
+  } else if (col > 0) {
+    col -= 1;
+  } else if (row > 0) {
+    col = maxCol;
+    row -= 1;
+  }
+
+  return { row, col };
+}
+
+/** Apply a movement, either collapsing to the target or extending the primary range. */
+function applyMove(
+  state: SelectionState,
+  target: CellRef,
+  shift: boolean,
+  bounds: SelectionBounds,
+): SelectionState {
+  const cell = clampCell(target.row, target.col, bounds);
+  if (!cell) return EMPTY_SELECTION;
+
+  if (!shift) {
+    return { ranges: [{ anchor: cell, focus: cell }], mode: 'cell', active: cell };
+  }
+
+  const anchor = state.ranges[primaryIndex(state)]?.anchor ?? cell;
+  return withPrimary(state, { anchor, focus: cell }, 'cell', cell);
+}
+
 /**
  * Pure selection reducer (GRID-SPEC §7).
  *
- * Phase 1 covers the pointer and header transitions, which the paint pass needs
- * to draw a highlight. Keyboard navigation is Phase 2 and adds events here
- * without changing this signature.
+ * Pointer and header transitions landed in Phase 1 because the paint pass needs
+ * them to draw a highlight; keyboard navigation is Phase 2. The reducer only
+ * reports where the active cell moved to — scrolling it into view is the grid's
+ * job, which is what keeps this module free of DOM and canvas concerns.
  */
 export function reduceSelection(
   state: SelectionState,
@@ -212,6 +325,69 @@ export function reduceSelection(
       const cell = clampCell(state.active.row, state.active.col, bounds);
       if (!cell) return EMPTY_SELECTION;
       return { ranges: [{ anchor: cell, focus: cell }], mode: 'cell', active: cell };
+    }
+
+    case 'move': {
+      const from = state.active;
+      const target = event.meta
+        ? dataEdge(from, event.direction, bounds)
+        : (() => {
+            const { dr, dc } = delta(event.direction);
+            return { row: from.row + dr, col: from.col + dc };
+          })();
+      return applyMove(state, target, event.shift, bounds);
+    }
+
+    case 'movePage': {
+      const pageRows = Math.max(1, Math.floor(bounds.pageRows ?? DEFAULT_PAGE_ROWS));
+      const direction = event.direction === 'up' ? -pageRows : pageRows;
+      return applyMove(
+        state,
+        { row: state.active.row + direction, col: state.active.col },
+        event.shift,
+        bounds,
+      );
+    }
+
+    case 'moveToEdge': {
+      const from = state.active;
+      const maxRow = bounds.rowCount - 1;
+      const maxCol = bounds.colCount - 1;
+      let target: CellRef;
+      switch (event.edge) {
+        case 'firstRow':
+          target = { row: 0, col: from.col };
+          break;
+        case 'lastRow':
+          target = { row: maxRow, col: from.col };
+          break;
+        case 'firstCol':
+          target = { row: from.row, col: 0 };
+          break;
+        case 'lastCol':
+          target = { row: from.row, col: maxCol };
+          break;
+        case 'start':
+          target = { row: 0, col: 0 };
+          break;
+        case 'end':
+          target = { row: maxRow, col: maxCol };
+          break;
+      }
+      return applyMove(state, target, event.shift, bounds);
+    }
+
+    case 'moveTab':
+      return applyMove(state, tabTarget(state.active, event.reverse, bounds), false, bounds);
+
+    case 'moveEnter': {
+      const direction = event.reverse ? -1 : 1;
+      return applyMove(
+        state,
+        { row: state.active.row + direction, col: state.active.col },
+        false,
+        bounds,
+      );
     }
   }
 }

@@ -93,11 +93,41 @@ export type SelectionEvent =
   | { readonly type: 'clickRowHeader'; readonly row: number; readonly shift: boolean }
   | { readonly type: 'clickColHeader'; readonly col: number; readonly shift: boolean }
   | { readonly type: 'clickCorner' }
-  | { readonly type: 'clear' };
+  | { readonly type: 'clear' }
+  // ── Phase 2: keyboard ──────────────────────────────────────────────────────
+  | {
+      readonly type: 'move';
+      readonly direction: MoveDirection;
+      readonly shift: boolean;
+      /** cmd/ctrl: jump to the edge of contiguous data instead of one cell. */
+      readonly meta: boolean;
+    }
+  | { readonly type: 'movePage'; readonly direction: 'up' | 'down'; readonly shift: boolean }
+  | { readonly type: 'moveToEdge'; readonly edge: SelectionEdge; readonly shift: boolean }
+  | { readonly type: 'moveTab'; readonly reverse: boolean }
+  | { readonly type: 'moveEnter'; readonly reverse: boolean };
+
+export type MoveDirection = 'up' | 'down' | 'left' | 'right';
+
+/**
+ * Absolute extent targets. `move` with `meta` is *data*-relative (it stops at a
+ * blank cell); these are always the sheet edges, which is what Cmd+Home/Cmd+End
+ * and Home/End mean in Excel.
+ */
+export type SelectionEdge = 'firstRow' | 'lastRow' | 'firstCol' | 'lastCol' | 'start' | 'end';
 
 export interface SelectionBounds {
   readonly rowCount: number;
   readonly colCount: number;
+  /** Viewport size in cells, for Page Up/Down. Defaults to 20 rows / 10 cols. */
+  readonly pageRows?: number;
+  readonly pageCols?: number;
+  /**
+   * Reports whether a cell is blank, so cmd+arrow can stop at the edge of a
+   * contiguous run the way Excel does. Omit it and cmd+arrow goes to the extent
+   * edge instead — a deliberate, testable fallback rather than a guess.
+   */
+  readonly isBlank?: (row: number, col: number) => boolean;
 }
 
 // ── Theme ────────────────────────────────────────────────────────────────────

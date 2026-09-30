@@ -330,13 +330,35 @@ A canvas exposes nothing to assistive tech. Build a proxy:
 ```
 
 - Mirrors only the **visible** window plus the active row, so it stays cheap at any row count.
-- `aria-rowcount`/`aria-colcount` carry the true totals; `aria-rowindex`/`aria-colindex` are 1-based absolute positions.
-- The grid container is `tabindex="0"` and handles all keyboard input; the proxy is `aria-hidden` from tab order.
-- Live region announces on selection change: `"Row 4212, column created_at, 2026-09-23T10:14:00Z"` — throttled so arrow-key repeat does not spam it.
+- `aria-rowcount`/`aria-colcount` carry the true totals; `aria-rowindex`/`aria-colindex` are 1-based absolute positions. **The header row occupies `aria-rowindex` 1**, so data rows start at 2 and `aria-rowcount` is `rowCount + 1`. Getting this wrong makes a screen reader announce every row off by one.
+- The grid container is `tabindex="0"` and handles all keyboard input; the proxy is visually hidden but **never `aria-hidden`** — it is the only thing assistive tech can see. The focus element links to it via `aria-describedby`.
+- Live region announces on selection change: `"Row 4212 of 1000000, column created_at, 2026-09-23T10:14:00Z"` — throttled so arrow-key repeat does not spam it, and identical consecutive messages are dropped.
 - All interactive DOM overlays (context menu, scrollbar, editor) are real focusable elements with correct roles.
 - Colour contrast meets WCAG AA in both themes; selection colour must remain distinguishable for the three common colour-vision deficiencies (never rely on red/green alone — pair colour with a glyph).
 
-**Exit criterion in Phase 2:** VoiceOver can navigate to and read a cell's row, column, and value.
+### Implementation finding: the proxy is a paint-budget problem
+
+Implemented as `grid/aria.ts`. Two rounds of measurement were needed:
+
+| Approach                                            | p50      | p95             | p99          |
+| --------------------------------------------------- | -------- | --------------- | ------------ |
+| Rebuild every frame                                 | 3.40     | 4.00            | **9.90ms**   |
+| Throttle to 10Hz _inside_ the rAF callback          | 2.40     | **8.10–9.60ms** | 8.60–10.50ms |
+| 10Hz on an independent timer **+ pooled DOM nodes** | **2.50** | **7.60ms**      | ~8.0ms       |
+
+Throttling alone only _moved_ the spike: whichever frame the rebuild landed on still paid for it.
+The real fix was structural — refresh on a timer that never runs inside a paint frame, and **pool the
+row/cell elements** instead of recreating ~780 nodes per refresh. Scrolling keeps the window size
+constant, so in steady state a refresh allocates nothing and is pure `textContent`/attribute writes
+behind a per-row signature check. An idle grid does no work at all.
+
+Corollary worth remembering: **accessibility work has a frame budget too.** "Add an ARIA mirror"
+sounds free and cost 25% of the paint budget until it was measured.
+
+**Exit criterion status:** the proxy structure, absolute indices, selected-cell exposure and the live-region
+announcement text are all asserted programmatically (26 unit tests + smoke assertions). **A real
+VoiceOver pass still requires a human** — structural correctness is necessary but not sufficient for
+a good screen-reader experience.
 
 ---
 

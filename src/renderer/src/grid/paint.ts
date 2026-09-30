@@ -63,6 +63,19 @@ function styleColor(theme: GridTheme, style: CellStyle): string {
   }
 }
 
+/**
+ * NULL renders italic and muted so a null is distinguishable from the empty
+ * string at a glance — the single most common source of "why is this row wrong"
+ * confusion in a database viewer.
+ *
+ * Prepending to the CSS font shorthand is safe (`italic 12px mono` is valid), and
+ * the measurement cache keys on the font string, so italic widths are computed
+ * separately rather than reusing the upright ones.
+ */
+function styleFont(theme: GridTheme, style: CellStyle): string {
+  return style === 'null' ? `italic ${theme.cellFont}` : theme.cellFont;
+}
+
 /** Pixel-space Y of a row range, intersected with the body. Null when off-screen. */
 function rowSpan(
   g: GridGeometry,
@@ -109,7 +122,8 @@ function paintCells(
   ctx.clip();
 
   const pad = theme.cellPaddingX;
-  ctx.font = theme.cellFont;
+  let currentFont = theme.cellFont;
+  ctx.font = currentFont;
   ctx.textBaseline = 'middle';
 
   for (const { row, y, height } of g.visibleRows) {
@@ -128,6 +142,14 @@ function paintCells(
 
       const formatted = cellText(cell);
       if (formatted.text === '') continue;
+
+      // Assigning ctx.font is not free, so only touch it when the style changes.
+      // In practice NULLs are scattered, so this flips a handful of times a frame.
+      const font = styleFont(theme, formatted.style);
+      if (font !== currentFont) {
+        currentFont = font;
+        ctx.font = font;
+      }
 
       const fitted = metrics.fit(ctx, formatted.text, available);
       if (fitted.text === '') continue;
