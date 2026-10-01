@@ -8,7 +8,7 @@ A desktop PostgreSQL database viewer with a from-scratch, Excel-like canvas data
 
 This project exists because of a challenge.
 
-My English mentor told me something simple but hard: *"Practice your English often."* Not just
+My English mentor told me something simple but hard: _"Practice your English often."_ Not just
 studying grammar — actually using it, every day, in real situations. So I decided to do something
 that would force me to speak, write, and think in English consistently: I started a YouTube channel
 where I build software from scratch and explain everything along the way.
@@ -35,31 +35,36 @@ learn from.
 
 ## Status
 
-**Phases 0–2 complete** — a hardened Electron shell plus a from-scratch canvas data grid that
-scrolls **1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel: pointer and
-keyboard selection, five clipboard formats, context menu, cell inspector, and an ARIA proxy grid.
-No database code yet — Phase 3 starts the IPC and `pg` layer.
+**Phases 0–3 complete** — a hardened Electron shell, a from-scratch canvas data grid that scrolls
+**1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel (pointer and keyboard
+selection, five clipboard formats, context menu, cell inspector, ARIA proxy grid), and a real
+three-process IPC contract with validated payloads and keychain-encrypted credentials.
+No database queries yet — Phase 4 wires up `pg`.
 
-| Check                         | Result                                                                                                           |
-| ----------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                               |
-| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                          |
-| `npm run typecheck`           | ✅ node + web projects                                                                                           |
-| `npm test`                    | ✅ **442 tests**, 19 files                                                                                       |
-| `npm run build`               | ✅ main · preload · renderer, all three bundles                                                                  |
-| `npm run smoke` (prod CSP)    | ✅ **39/39 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav and copy verified end-to-end |
-| `npm run smoke:dev` (dev CSP) | ✅ **39/39** — both correctly **allowed** under the dev policy                                                   |
-| `npm run bench`               | ✅ p50 2.50 · **p95 7.60ms** vs 10ms budget · **60.0 fps** · 1 dropped in 599                                    |
+| Check                         | Result                                                                                                                                      |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                                                          |
+| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                                                     |
+| `npm run typecheck`           | ✅ node + web projects                                                                                                                      |
+| `npm test`                    | ✅ **542 tests**, 22 files                                                                                                                  |
+| `npm run build`               | ✅ main (3 entries) · preload · renderer                                                                                                    |
+| `npm run smoke` (prod CSP)    | ✅ **59/59 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav, copy, IPC round-trip and 8/8 hostile payloads rejected |
+| `npm run smoke:dev` (dev CSP) | ✅ **59/59** — both correctly **allowed** under the dev policy                                                                              |
+| `npm run bench`               | ✅ p50 2.60 · **p95 7.40ms** vs 10ms budget · **60.0 fps** · 1 dropped in 599                                                               |
 
 Runtime confirmed as **Electron 44.4.5 / Chromium 152.0.7977.130 / Node 24.21.0**, with no
-`require`, `process`, or `Buffer` leaking into the renderer, and a one-entry permission allowlist
-(`clipboard-sanitized-write`) that denies everything else outright.
+`require`, `process`, `Buffer`, or `ipcRenderer` leaking into the renderer, `window.tabby` frozen,
+and a one-entry permission allowlist (`clipboard-sanitized-write`) that denies everything else.
+
+Passwords are stored as `safeStorage` ciphertext and refused outright when no OS keychain is
+available — never written in plaintext as a fallback. Every log line passes through a redactor.
 
 The grid is 22 modules / ~5,000 lines in `src/renderer/src/grid/`, importing nothing from the app —
 enforced by an ESLint boundary rule so it stays headlessly testable and extractable.
 
-**Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy, and text crispness when
-dragging to a different-DPI monitor. Both are asserted structurally in code but need eyes.
+**Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy, macOS full-screen
+restore, and text crispness when dragging to a different-DPI monitor. All are implemented and
+asserted structurally in code, but need eyes.
 
 ## Getting started
 

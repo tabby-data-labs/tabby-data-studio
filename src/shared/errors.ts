@@ -28,6 +28,8 @@ export type TabbyErrorCode =
   // plumbing
   | 'VALIDATION_FAILED'
   | 'NOT_CONNECTED'
+  | 'NOT_FOUND'
+  | 'KEYCHAIN_UNAVAILABLE'
   | 'INTERNAL';
 
 export interface TabbyError {

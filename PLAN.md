@@ -333,7 +333,7 @@ Delivered as 22 modules / 5,047 lines in `src/renderer/src/grid/`. New in Phase 
   wiring; the large-range behaviour is covered by the chunking and progress tests instead.
 - **No coverage measurement** (unchanged from Phase 1 — no coverage provider installed).
 
-### Phase 3 — Electron shell & IPC · 5 days · ◄── NEXT
+### Phase 3 — Electron shell & IPC · ✅ COMPLETE (2026-09-27)
 
 **Goal:** the hardened three-process contract is real, not a stub.
 
@@ -344,9 +344,52 @@ Delivered as 22 modules / 5,047 lines in `src/renderer/src/grid/`. New in Phase 
 - Window state persistence; macOS full-screen and restore behaviour
 - Tab UI shell (result tabs, query tabs)
 
-**Exit criteria:** renderer can round-trip a validated request; malformed/hostile IPC payloads are rejected and logged; passwords are ciphertext at rest and never appear in logs or DevTools.
+**Exit criteria — all three verified end-to-end in real Electron (59/59 smoke assertions):**
 
-### Phase 4 — Postgres data layer · 8–12 days
+| Criterion                                                   | Result                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Renderer can round-trip a validated request                 | ✅ `getSettings()` → `patchSettings({theme:'light'})` → re-read returns `'light'`. Full path exercised: renderer → contextBridge → `ipcMain` → validator → `SettingsStore` → `Result` back.                                                                                                                                         |
+| Malformed/hostile payloads are rejected and logged          | ✅ **8/8 hostile payloads** returned tagged `VALIDATION_FAILED` — none accepted, **none threw** across the bridge: wrong type, unknown key, negative row, 100M-row window, NUL byte in SQL, bad enum, `__proto__` pollution, non-object. Rejections log channel + field path only, never the payload, which could carry a password. |
+| Passwords are ciphertext at rest, never in logs or DevTools | ✅ The settings file is read back **from the main process** — the renderer cannot attest to this without the check being circular. It contains `enc(…)` ciphertext and not the plaintext. `ConnectionSummary` carries neither plaintext nor ciphertext. Every log line passes through `scrub()`.                                    |
+
+Also asserted: `Object.isFrozen(window.tabby)`, no `ipcRenderer` leak, double `deleteConnection` →
+`NOT_FOUND`, and an unimplemented channel answers `NOT_CONNECTED` rather than throwing.
+
+Delivered: `src/main/ipc/{validate,router}.ts`, `src/main/store/{cipher,settings-store}.ts`,
+`src/main/window/window-state.ts`, `src/main/log.ts`, the full typed preload bridge, and
+`stores/tabs.ts` + `TabBar.vue`. **542 tests across 22 files**; paint budget unchanged
+(p50 2.60 · p95 7.40 · p99 7.90ms, 60.0 fps, 1 dropped in 599).
+
+**Four decisions worth recording:**
+
+1. **The Phase-4 placeholder channels validate _now_, not later.** My first router registered them
+   with a parser that accepted anything, so a hostile payload to `resultWindow` short-circuited to
+   `NOT_CONNECTED` and was never validated. The smoke harness caught it. Every channel is now
+   validated and returns `NOT_CONNECTED` only _after_ validation passes — so an unimplemented
+   handler cannot become a hole, and Phase 4 swaps a handler body instead of rewiring guards.
+2. **No third-party schema library.** The validators are ~320 hand-written lines, not the ~120
+   estimated. That is the security boundary of the whole app, it is covered by 42 tests, and it keeps
+   the runtime dependency count at exactly one.
+3. **An unavailable keychain refuses rather than falling back to plaintext.** `safeStorage` can be
+   unavailable (Linux without a keyring). A database password in cleartext JSON is a leak that
+   outlives the session and is invisible to the user, so `saveConnection` returns
+   `KEYCHAIN_UNAVAILABLE` instead. Saving without a password still works, and editing a connection's
+   name preserves its stored credential.
+4. **`getNormalBounds()`, not `getBounds()`, for persisted geometry.** For a maximised or full-screen
+   window the latter returns the enlarged geometry, so restoring it leaves the user with an
+   un-maximised window the size of their whole screen. Writes are debounced at 500ms and flushed
+   synchronously on `close`, because `resize` fires per pixel and each persist is a sync write.
+
+**Corrupt-file behaviour:** a hand-edited or truncated `settings.json` falls back to defaults with a
+surfaced `loadWarning` rather than throwing during startup, where there is no UI to show the failure
+in. A malformed connection entry is dropped while valid ones are kept — losing every saved
+connection over one bad field is the worse outcome.
+
+**Not done in Phase 3:** the tab shell renders and its store is fully tested (31 specs), but the tabs
+are seeded placeholders; real query/result tabs get wired in Phases 4 and 7 when there are queries to
+run. macOS full-screen _restore_ is implemented but has not been exercised by a human.
+
+### Phase 4 — Postgres data layer · 8–12 days · ◄── NEXT
 
 **Goal:** real queries, positionable and bounded, and provably read-only.
 

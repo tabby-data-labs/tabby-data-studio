@@ -10,9 +10,14 @@
  * Exits non-zero on any failed assertion or unexpected console error.
  */
 import { app, BrowserWindow, clipboard } from 'electron';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { applySecurityGuards, type CspProfile } from './security/navigation';
+import { registerIpcHandlers } from './ipc/router';
+import { SettingsStore } from './store/settings-store';
+import type { SecretCipher } from './store/cipher';
 
 const defaultUrl = pathToFileURL(join(__dirname, '../renderer/index.html')).href;
 const target = process.env['TABBY_SMOKE_URL'] ?? defaultUrl;
@@ -51,6 +56,16 @@ app
   .whenReady()
   .then(async () => {
     applySecurityGuards(profile);
+
+    // Real router against a throwaway settings dir, so the IPC round-trip under
+    // test is the production code path rather than a stub.
+    const settingsDir = mkdtempSync(join(tmpdir(), 'tabby-smoke-'));
+    const cipher: SecretCipher = {
+      available: true,
+      encrypt: (plain) => `enc(${Buffer.from(plain, 'utf8').toString('base64')})`,
+      decrypt: (ct) => Buffer.from(ct.slice(4, -1), 'base64').toString('utf8'),
+    };
+    const settings = new SettingsStore({ dir: settingsDir, cipher });
 
     // Watchdog: a stalled executeJavaScript must fail loudly, not hang CI forever.
     const watchdog = setTimeout(() => {
@@ -104,6 +119,8 @@ app
       problems.push(`renderer gone: ${details.reason}`);
     });
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+    const disposeIpc = registerIpcHandlers({ settings, window: () => win });
 
     await win.loadURL(target);
     // The document must hold focus or Chromium rejects clipboard writes.
@@ -287,8 +304,112 @@ app
 
     if (interaction.error) problems.push(`interaction: ${interaction.error}`);
 
+    // ── IPC round-trip ─────────────────────────────────────────────────────────
+    // Exercises the production path end to end: renderer -> contextBridge ->
+    // ipcMain -> validator -> SettingsStore -> Result back. Also proves a hostile
+    // payload is rejected rather than acted on, and that no channel throws.
+    const ipc = (await win.webContents.executeJavaScript(`(async () => {
+    const out = {};
+    const db = window.tabby && window.tabby.db;
+    out.hasDb = !!db;
+    out.hasEvents = !!(window.tabby && window.tabby.events);
+    out.ipcRendererLeaked = typeof window.ipcRenderer !== 'undefined';
+    out.requireLeakedAgain = typeof window.require !== 'undefined';
+    out.frozen = Object.isFrozen(window.tabby);
+
+    if (!db) return out;
+
+    const settings = await db.getSettings();
+    out.settingsOk = settings.ok === true;
+    out.theme = settings.ok ? settings.value.theme : null;
+    out.connectionsAtStart = settings.ok ? settings.value.connections.length : -1;
+
+    // A validated write that must persist.
+    const patched = await db.patchSettings({ theme: 'light' });
+    out.patchOk = patched.ok === true;
+    out.themeAfterPatch = patched.ok ? patched.value.theme : null;
+    const reread = await db.getSettings();
+    out.themePersisted = reread.ok ? reread.value.theme : null;
+
+    // Save a connection with a password; the summary must not carry it.
+    const saved = await db.saveConnection({
+      connection: {
+        id: 'smoke-1', name: 'Smoke', host: 'db.internal', port: 5432,
+        database: 'app', user: 'reader', sslMode: 'verify-full',
+        createdAt: 1700000000000, updatedAt: 1700000000000,
+      },
+      password: 'sup3r-s3cret-do-not-log',
+    });
+    out.saveOk = saved.ok === true;
+    out.summaryKeys = saved.ok ? Object.keys(saved.value).sort() : [];
+    out.summaryLeaksSecret = saved.ok
+      ? JSON.stringify(saved.value).includes('sup3r-s3cret-do-not-log')
+      : null;
+
+    const listed = await db.listConnections();
+    out.listCount = listed.ok ? listed.value.length : -1;
+    out.listLeaksSecret = listed.ok
+      ? JSON.stringify(listed.value).includes('sup3r-s3cret-do-not-log')
+      : null;
+    out.listLeaksCiphertext = listed.ok ? JSON.stringify(listed.value).includes('enc(') : null;
+
+    // Hostile payloads: each must come back as a tagged VALIDATION_FAILED,
+    // never a thrown error and never a partial success.
+    const hostile = [
+      ['wrongType', db.resultWindow({ resultId: 'r', startRow: 'zero', rowCount: 10 })],
+      ['unknownKey', db.resultWindow({ resultId: 'r', startRow: 0, rowCount: 10, isAdmin: true })],
+      ['negativeRow', db.resultWindow({ resultId: 'r', startRow: -1, rowCount: 10 })],
+      ['hugeWindow', db.resultWindow({ resultId: 'r', startRow: 0, rowCount: 100000000 })],
+      ['nulInSql', db.queryRun({ connectionId: 'c', sql: 'SELECT 1;\\u0000DROP TABLE t' })],
+      ['badEnum', db.patchSettings({ theme: 'solarised' })],
+      ['protoPollution', db.patchSettings(JSON.parse('{"theme":"dark","__proto__":{"x":1}}'))],
+      ['notAnObject', db.patchSettings('nonsense')],
+    ];
+    out.hostile = {};
+    for (const [name, promise] of hostile) {
+      try {
+        const res = await promise;
+        out.hostile[name] = res.ok === false ? (res.error.code || 'untagged') : 'ACCEPTED';
+      } catch (e) {
+        out.hostile[name] = 'THREW:' + String(e).slice(0, 60);
+      }
+    }
+    out.protoPolluted = ({}).x !== undefined;
+
+    // An unimplemented channel must answer with a typed error, not throw.
+    const pending = await db.queryCancel('r1');
+    out.unimplementedCode = pending.ok === false ? pending.error.code : 'ACCEPTED';
+
+    // Deletion is tested in a second pass, after main has read the settings file
+    // off disk — deleting here first would make the ciphertext check vacuous.
+    return out;
+  })()`)) as Record<string, unknown>;
+
+    // Read the settings file straight off disk to confirm the secret is ciphertext
+    // at rest. The renderer cannot tell us that, and trusting it would be circular.
+    let onDisk: string;
+    try {
+      onDisk = readFileSync(join(settingsDir, 'settings.json'), 'utf8');
+    } catch {
+      onDisk = '';
+    }
+
+    const deletion = (await win.webContents.executeJavaScript(`(async () => {
+    const db = window.tabby.db;
+    const deleted = await db.deleteConnection('smoke-1');
+    const missing = await db.deleteConnection('smoke-1');
+    return {
+      deleteOk: deleted.ok === true,
+      deleteMissingCode: missing.ok === false ? missing.error.code : 'ACCEPTED',
+    };
+  })()`)) as { deleteOk: boolean; deleteMissingCode: string };
+
+    disposeIpc();
+    rmSync(settingsDir, { recursive: true, force: true });
+
     const steps = interaction.steps ?? {};
     const ariaInfo = interaction.aria;
+    const hostile = (ipc.hostile ?? {}) as Record<string, string>;
     const has = (text: string | undefined, needle: string): boolean =>
       typeof text === 'string' && text.includes(needle);
 
@@ -385,6 +506,49 @@ app
       ['selected cells are exposed to assistive tech', Number(ariaInfo?.selectedCells ?? 0) > 0],
       ['live region announced the active cell', String(ariaInfo?.liveText ?? '').length > 0],
 
+      // ── IPC contract ───────────────────────────────────────────────────────
+      ['bridge exposes the db API', ipc.hasDb === true],
+      ['bridge exposes event subscriptions', ipc.hasEvents === true],
+      ['bridge object is frozen', ipc.frozen === true],
+      ['ipcRenderer not leaked', ipc.ipcRendererLeaked === false],
+      ['settings round-trips', ipc.settingsOk === true],
+      [
+        'settings patch persists',
+        ipc.themeAfterPatch === 'light' && ipc.themePersisted === 'light',
+      ],
+      ['connection saved', ipc.saveOk === true],
+      ['connection listed back', ipc.listCount === 1],
+      [
+        'summary carries no secret field',
+        Array.isArray(ipc.summaryKeys) &&
+          !ipc.summaryKeys.includes('encryptedPassword') &&
+          !ipc.summaryKeys.includes('password'),
+      ],
+      ['summary contains no plaintext password', ipc.summaryLeaksSecret === false],
+      ['list contains no plaintext password', ipc.listLeaksSecret === false],
+      ['list contains no ciphertext either', ipc.listLeaksCiphertext === false],
+      // The renderer cannot verify this; reading the file from main is the point.
+      [
+        'password is ciphertext at rest',
+        onDisk.includes('enc(') && !onDisk.includes('sup3r-s3cret-do-not-log'),
+      ],
+      ['connection deleted', deletion.deleteOk === true],
+      ['deleting twice reports NOT_FOUND', deletion.deleteMissingCode === 'NOT_FOUND'],
+      [
+        'unimplemented channel answers with a typed error',
+        ipc.unimplementedCode === 'NOT_CONNECTED',
+      ],
+      [
+        'no channel threw across the bridge',
+        !Object.values(hostile).some((v) => String(v).startsWith('THREW')),
+      ],
+      ['no hostile payload was accepted', !Object.values(hostile).some((v) => v === 'ACCEPTED')],
+      [
+        'every hostile payload was tagged VALIDATION_FAILED',
+        Object.values(hostile).every((v) => v === 'VALIDATION_FAILED'),
+      ],
+      ['prototype pollution did not reach Object.prototype', ipc.protoPolluted === false],
+
       ['no unexpected console errors', problems.length === 0],
     ];
 
@@ -405,6 +569,7 @@ app
             userActivation: activation,
           },
           cspEnforcement,
+          ipc: { ...ipc, hostile, deletion, onDiskHasCiphertext: onDisk.includes('enc(') },
           problems,
           assertions: assertions.map(([name, passed]) => ({ name, passed })),
           failures,

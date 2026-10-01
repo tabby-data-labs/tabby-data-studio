@@ -143,5 +143,12 @@ export default tseslint.config(
     rules: { 'no-console': 'off' },
   },
 
+  // The logging module is the one place console *is* the implementation. Every
+  // other call site must go through it, so the redactor cannot be bypassed.
+  {
+    files: ['src/main/log.ts'],
+    rules: { 'no-console': 'off' },
+  },
+
   prettier,
 );

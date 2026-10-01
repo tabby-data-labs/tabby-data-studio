@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, shallowRef } from 'vue';
 import DataGridVue from '@/components/DataGridVue.vue';
+import TabBar from '@/components/TabBar.vue';
 import { runScrollBench, type BenchResult } from '@/grid/bench';
 import type { DataGrid } from '@/grid/create-data-grid';
 import type { ClipboardFormat } from '@/grid/clipboard';
 import { FakeDataSource } from '@/grid/fake-source';
 import { boundingBox, selectedCellCount } from '@/grid/selection';
 import type { SelectionState, SortSpec } from '@/grid/types';
+import { useTabsStore } from '@/stores/tabs';
 
 const ROW_COUNT = 1_000_000;
 const COLUMN_COUNT = 30;
@@ -27,9 +29,19 @@ const notice = ref<string | null>(null);
 const copying = ref<ClipboardFormat | null>(null);
 const copyProgress = ref(0);
 const versions = ref<{ electron: string; chrome: string; node: string } | null>(null);
+const tabs = useTabsStore();
 
 onMounted(() => {
   if (window.tabby) versions.value = { ...window.tabby.versions };
+
+  // Seed the shell so the tab strip is demonstrable before Phase 4 wires real
+  // result tabs to queries. One editor and one result, matching the two kinds.
+  tabs.openQuery(null);
+  tabs.openResult({
+    resultId: 'synthetic',
+    title: 'synthetic 1M rows',
+    connectionId: null,
+  });
 });
 
 const selectionSummary = computed(() => {
@@ -207,6 +219,8 @@ function onGoToRow(): void {
       <span class="text-muted">{{ bench.sustainedFps.toFixed(1) }} fps sustained</span>
       <span class="text-muted">{{ bench.measureTextCalls.toLocaleString() }} measureText</span>
     </div>
+
+    <TabBar />
 
     <main class="min-h-0 flex-1">
       <DataGridVue

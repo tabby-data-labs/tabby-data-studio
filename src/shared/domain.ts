@@ -26,6 +26,33 @@ export interface StoredConnection {
 /** A connection as the renderer may see it — no secret material at all. */
 export type ConnectionSummary = Omit<StoredConnection, 'encryptedPassword'>;
 
+// ── App settings ─────────────────────────────────────────────────────────────
+
+export type ThemeName = 'dark' | 'light';
+
+export interface WindowState {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly isMaximized: boolean;
+  readonly isFullScreen: boolean;
+}
+
+/**
+ * Persisted to `userData/settings.json`. `connections[].encryptedPassword` is
+ * `safeStorage` ciphertext — never plaintext, and never sent to the renderer.
+ */
+export interface AppSettings {
+  readonly version: number;
+  readonly connections: readonly StoredConnection[];
+  readonly window: WindowState;
+  readonly theme: ThemeName;
+}
+
+/** What the renderer may ask main to change. Connections go through their own channels. */
+export type SettingsPatch = Partial<Pick<AppSettings, 'theme' | 'window'>>;
+
 // ── Schema ───────────────────────────────────────────────────────────────────
 
 export type SchemaNodeKind =

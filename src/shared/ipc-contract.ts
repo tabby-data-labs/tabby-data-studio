@@ -12,12 +12,20 @@ import type {
   RowBlock,
   ResultMeta,
   SchemaNode,
+  SettingsPatch,
   SortSpec,
   StoredConnection,
   TableMeta,
+  ThemeName,
+  WindowState,
 } from './domain';
 
 export const IpcChannel = {
+  // settings & window (Phase 3)
+  settingsGet: 'settings:get',
+  settingsPatch: 'settings:patch',
+  windowState: 'window:state',
+
   // connections
   connList: 'conn:list',
   connSave: 'conn:save',
@@ -57,10 +65,6 @@ export interface ConnSaveRequest {
   readonly password?: string;
 }
 
-export interface ConnTestRequest {
-  readonly connectionId: string;
-}
-
 export interface SchemaChildrenRequest {
   readonly connectionId: string;
   readonly parentSchema: string | null;
@@ -92,6 +96,19 @@ export interface ResultSortRequest {
 
 // ── Responses ────────────────────────────────────────────────────────────────
 
+/**
+ * What the renderer may see of the persisted settings. Secret material is
+ * absent by construction: connections arrive as summaries, never as
+ * `StoredConnection`, so there is no ciphertext to accidentally surface.
+ */
+export interface SettingsSnapshot {
+  readonly connections: readonly ConnectionSummary[];
+  readonly window: WindowState;
+  readonly theme: ThemeName;
+  /** Non-null when the on-disk file was corrupt and had to be reset. */
+  readonly loadWarning: string | null;
+}
+
 export interface QueryRunResponse {
   readonly resultId: string;
   readonly meta: ResultMeta;
@@ -110,10 +127,15 @@ export interface QueryProgressEvent {
  * preload implementation is checked against the same interface.
  */
 export interface DatabaseApi {
+  // settings & window (Phase 3)
+  getSettings(): Promise<Result<SettingsSnapshot>>;
+  patchSettings(patch: SettingsPatch): Promise<Result<SettingsSnapshot>>;
+  getWindowState(): Promise<Result<WindowState>>;
+
   listConnections(): Promise<Result<readonly ConnectionSummary[]>>;
   saveConnection(req: ConnSaveRequest): Promise<Result<ConnectionSummary>>;
   deleteConnection(connectionId: string): Promise<Result<void>>;
-  testConnection(req: ConnTestRequest): Promise<Result<{ readonly serverVersion: string }>>;
+  testConnection(connectionId: string): Promise<Result<{ readonly serverVersion: string }>>;
   openConnection(connectionId: string): Promise<Result<void>>;
   closeConnection(connectionId: string): Promise<Result<void>>;
 
