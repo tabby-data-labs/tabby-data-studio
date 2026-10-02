@@ -58,3 +58,54 @@ jobs:
       - name: Audit runtime dependencies
         run: npm audit --omit=dev --audit-level=moderate
         continue-on-error: true
+
+  # Phase 4's exit criteria are claims about the server, not about our code: that
+  # read-only mode is really on, that a NO SCROLL cursor really cannot scan
+  # backward, that the first 1000 rows of a 10M-row table really land inside
+  # 500ms. A mock can only confirm we asked for what we meant to ask for, so these
+  # run against a real Postgres.
+  #
+  # Separate job on ubuntu-latest because service containers need Docker, which
+  # the macOS runner does not provide.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: tabby
+          POSTGRES_PASSWORD: tabby
+          POSTGRES_DB: tabby-data-test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TABBY_TEST_PG_HOST: localhost
+      TABBY_TEST_PG_PORT: '5432'
+      TABBY_TEST_PG_USER: tabby
+      TABBY_TEST_PG_PASSWORD: tabby
+      TABBY_TEST_PG_DATABASE: tabby-data-test
+      # Prints the measured latencies into the log, so a regression is visible
+      # even while the budget assertions still pass.
+      TABBY_REPORT_PERF: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # 10M rows plus one table per row-identity shape, type-fidelity fixture and
+      # awkward identifier. Idempotent; about a minute.
+      - name: Load fixtures
+        run: npm run pg:fixtures
+
+      - name: Integration tests (live Postgres 18)
+        run: npm run test:pg

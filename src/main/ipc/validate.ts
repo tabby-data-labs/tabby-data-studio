@@ -16,6 +16,7 @@
  *    Postgres identifier unbrowsable without making anything safer.
  */
 import type {
+  BrowseTarget,
   ConnSaveRequest,
   QueryRunRequest,
   ResultSortRequest,
@@ -204,13 +205,34 @@ export function validateResultWindow(value: unknown): ResultWindowRequest {
 
 export function validateQueryRun(value: unknown): QueryRunRequest {
   const record = object(value, 'request');
-  exactKeys(record, ['connectionId', 'sql', 'initialRows'], '');
+  exactKeys(record, ['connectionId', 'sql', 'initialRows', 'browse'], '');
   const connectionId = str(record['connectionId'], 'connectionId', { max: MAX_ID_LENGTH });
   const sql = sqlText(record['sql'], 'sql');
   const initialRows = optional(record, 'initialRows', 'initialRows', (v, f) =>
     int(v, f, 1, MAX_WINDOW_ROWS),
   );
-  return initialRows === undefined ? { connectionId, sql } : { connectionId, sql, initialRows };
+  const browse = optional(record, 'browse', 'browse', validateBrowse);
+  return {
+    connectionId,
+    sql,
+    ...(initialRows === undefined ? {} : { initialRows }),
+    ...(browse === undefined ? {} : { browse }),
+  };
+}
+
+/**
+ * The table a plain scan targets.
+ *
+ * Names only — the renderer never chooses key columns, because which columns
+ * identify a row is a correctness decision main makes from the catalog.
+ */
+function validateBrowse(value: unknown, field: string): BrowseTarget {
+  const record = object(value, field);
+  exactKeys(record, ['schema', 'table'], field);
+  return {
+    schema: identifier(record['schema'], nested(field, 'schema')),
+    table: identifier(record['table'], nested(field, 'table')),
+  };
 }
 
 /**

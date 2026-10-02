@@ -9,7 +9,7 @@ import type { Result } from './errors';
 import type {
   ColumnMeta,
   ConnectionSummary,
-  RowBlock,
+  EncodedRowBlock,
   ResultMeta,
   SchemaNode,
   SettingsPatch,
@@ -81,6 +81,20 @@ export interface QueryRunRequest {
   readonly sql: string;
   /** Rows fetched eagerly before the first window request. */
   readonly initialRows?: number;
+  /**
+   * Set only when `sql` is a plain scan of one table. It lets main page with a
+   * keyset seek or `OFFSET` and hold **no transaction open**, instead of pinning a
+   * cursor for as long as the tab is open.
+   *
+   * Names only: main resolves the key columns from the catalog itself, because
+   * which columns identify a row is a correctness decision, not a renderer choice.
+   */
+  readonly browse?: BrowseTarget;
+}
+
+export interface BrowseTarget {
+  readonly schema: string;
+  readonly table: string;
 }
 
 export interface ResultWindowRequest {
@@ -123,8 +137,8 @@ export interface QueryProgressEvent {
 // ── The bridge shape ─────────────────────────────────────────────────────────
 
 /**
- * Grows in Phase 3. Declared here so the renderer can code against it and the
- * preload implementation is checked against the same interface.
+ * The complete bridge surface. The preload implements it and the renderer codes
+ * against it, so a channel added in one place without the other fails typecheck.
  */
 export interface DatabaseApi {
   // settings & window (Phase 3)
@@ -141,10 +155,16 @@ export interface DatabaseApi {
 
   schemaChildren(req: SchemaChildrenRequest): Promise<Result<readonly SchemaNode[]>>;
   schemaTable(req: SchemaTableRequest): Promise<Result<TableMeta>>;
+  /** Drops the cached catalog for one connection. Returns the number of entries freed. */
+  refreshSchema(connectionId: string): Promise<Result<number>>;
 
   queryRun(req: QueryRunRequest): Promise<Result<QueryRunResponse>>;
   queryCancel(resultId: string): Promise<Result<void>>;
-  resultWindow(req: ResultWindowRequest): Promise<Result<RowBlock>>;
+  /**
+   * Columnar and packed (ARCHITECTURE §5.4): a block of a million rows arrives as
+   * typed arrays, and the renderer decodes a cell only when it paints it.
+   */
+  resultWindow(req: ResultWindowRequest): Promise<Result<EncodedRowBlock>>;
   resultSort(req: ResultSortRequest): Promise<Result<ResultMeta>>;
   resultDispose(resultId: string): Promise<Result<void>>;
 }

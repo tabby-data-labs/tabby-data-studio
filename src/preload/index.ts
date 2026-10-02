@@ -52,6 +52,7 @@ const db: DatabaseApi = {
 
   schemaChildren: (req) => invoke(IpcChannel.schemaChildren, req),
   schemaTable: (req) => invoke(IpcChannel.schemaTable, req),
+  refreshSchema: (connectionId) => invoke(IpcChannel.schemaRefresh, connectionId),
 
   queryRun: (req) => invoke(IpcChannel.queryRun, req),
   queryCancel: (resultId) => invoke(IpcChannel.queryCancel, resultId),

@@ -129,7 +129,7 @@ The stated goal is a minimal third-party surface. Make that a **measurable invar
 
 Editing data (INSERT/UPDATE/DELETE through the grid), DDL execution, schema diffing, ERD diagrams, other database engines, cloud sync, plugins/extensions, auto-update, Excel binary export.
 
-**However:** v1 must not make v2 expensive. `docs/ARCHITECTURE.md` §6 is a **design sketch** — as of Phase 2 none of it exists in code — and it is written so cell editing stays _additive_ rather than a rewrite: a `RowIdentityResolver`, a `ChangeBuffer`, and a mutable `DataSource` variant. The only editing groundwork actually in place today is `TableMeta.primaryKey` in `src/shared/domain.ts`, which Phase 4 populates from `pg_catalog`; Phase 4 also declares those two interfaces. See Phase 10 for the rest.
+**However:** v1 must not make v2 expensive. `docs/ARCHITECTURE.md` §6 is a **design sketch** — as of Phase 4 the only part of it that exists in code is four type declarations at the bottom of `src/shared/domain.ts` — and it is written so cell editing stays _additive_ rather than a rewrite: a `RowIdentityResolver`, a `ChangeBuffer`, and a mutable `DataSource` variant. The editing groundwork in place today is `TableMeta.primaryKey` and `TableMeta.uniqueIndexes`, both populated from `pg_catalog` by Phase 4, plus the declared `RowKey` / `RowIdentityResolver` / `Change` / `ChangeBuffer` interfaces — no implementation, no editor, no write path. See Phase 10 for the rest.
 
 ### Non-negotiable product qualities
 
@@ -389,7 +389,7 @@ connection over one bad field is the worse outcome.
 are seeded placeholders; real query/result tabs get wired in Phases 4 and 7 when there are queries to
 run. macOS full-screen _restore_ is implemented but has not been exercised by a human.
 
-### Phase 4 — Postgres data layer · 8–12 days · ◄── NEXT
+### Phase 4 — Postgres data layer · ✅ COMPLETE (2026-10-01)
 
 **Goal:** real queries, positionable and bounded, and provably read-only.
 
@@ -408,7 +408,90 @@ run. macOS full-screen _restore_ is implemented but has not been exercised by a 
 
 **Exit criteria:** a `SELECT` over a 10M-row table returns its first 1000 rows in <500ms of client overhead; jumping to an arbitrary row offset works; cancelling a long query returns the UI to responsive within 200ms; `default_transaction_read_only` is verified on by a test that asserts an `INSERT` attempt fails with SQLSTATE `25006`; the registry never exceeds its memory cap under a soak test.
 
-### Phase 5 — Grid on live data · 5 days
+#### Result
+
+Verified against **PostgreSQL 18.6** on localhost, with a seeded 10M-row / 789 MB `fixtures.big`
+(`scripts/pg-fixtures.sql`, idempotent). Every number below is a measurement from
+`TABBY_REPORT_PERF=1 npm run test:pg` — one run on an arm64 MacBook with the server local, so read
+them as an order of magnitude rather than a benchmark to beat. Repeat runs varied by a few ms.
+
+| Exit criterion                                          | Result                                                                                                                                                                             |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| First 1000 rows of a 10M-row `SELECT` in <500ms         | ✅ **19.1ms** client overhead (DECLARE + FETCH 1000 + columnar encode). First window served from the prefetch: **0.2ms**.                                                          |
+| Jumping to an arbitrary row offset works                | ✅ forward to row 800,000 in **63.4ms**; backward to row 10 in **1.1ms**; browse-mode `OFFSET` to row 5,000,000 in **372.9ms**. All returned the correct rows.                     |
+| Cancel returns the UI to responsive within 200ms        | ✅ **2.8ms**, and the in-flight `FETCH` failed with SQLSTATE **57014** → `QUERY_CANCELLED`                                                                                         |
+| Read-only verified by an `INSERT` failing with `25006`  | ✅ `25006` → `READ_ONLY_VIOLATION`. Also asserted for `UPDATE`, `DELETE`, `CREATE`, `DROP`, `TRUNCATE`, and through the query channel. The probe table has **0 rows** afterwards.  |
+| Registry never exceeds its memory cap under a soak test | ✅ 12 results × 4 windows against `maxEntries: 3` / `maxBytes: 400 kB`; caps checked after **every** operation. All evicted cursors released — **0** idle-in-transaction backends. |
+
+Gate: `npm run verify` ✅ (deps `pg` only · prettier clean · lint 0/0 · typecheck both projects ·
+**889 unit tests** · build) · `npm run test:pg` ✅ **44 integration tests** · `npm run smoke` and
+`smoke:dev` ✅ **61/61** each, 0 failures · `npm run bench` ✅ p50 2.60 · **p95 3.40** · p99 5.90ms ·
+**60.0 fps** · 1 dropped in 599 · 0 measureText misses.
+
+Delivered: `src/main/db/{ident,sql-scan,session,pg-config,pg-error,result-sql,result-registry,introspect,row-shape,driver-pg,connection-manager,schema-service,query-service,services}.ts`,
+`src/shared/{pg-types,columnar}.ts`, the real router handlers, and `tests/integration/`. `pg` is still
+imported by exactly one file.
+
+**Ten findings that changed the design — all found by running against a real server, not by reading:**
+
+1. **`NO SCROLL` cannot scan backward, and trying _aborts the whole transaction_.** §5.2 claimed "the
+   grid only ever moves forward plus jumps, which `MOVE ABSOLUTE` covers." That is wrong: a user
+   scrolling up produces `ERROR: cursor can only scan forward`, after which the cursor is unusable.
+   Fixed by closing and re-declaring inside the **same** transaction, which is why the transaction is
+   `REPEATABLE READ` — the re-declared cursor reads the same snapshot, so rows do not shift.
+2. **`max: 2` in §5.1 deadlocks.** Every result holds its client for its whole life, so four results
+   plus the reserved cancel client leave nothing for catalog reads or the background count, and the
+   next schema-tree expansion queues forever. Now `4 cursors + 1 cancel + 2 aux = 7`.
+3. **Session hardening raced the first query.** Issuing the eight `SET`s through a `.then()` chain
+   defers to a microtask, and the pool resolves the waiting caller in the same tick — so a query could
+   run before the settings landed. Observed for real: `current_setting('TimeZone')` returned
+   `Asia/Jakarta` on a connection that already reported read-only mode **on**. Now one multi-statement
+   `SET`, enqueued synchronously in the pool's `connect` handler.
+4. **`pg` returns `name[]` as text.** `array_agg(attname)` came back as `{tenant_id,seq}`, and
+   spreading that string produced a primary key of `['{','t','e','n',…]` — punctuation that would have
+   been quoted straight into a `WHERE` clause and silently matched nothing. Fixed with `::text[]`, and
+   `toTableMeta` now throws a `TypeError` rather than spreading a non-array.
+5. **`pg`'s default parsers lose fidelity.** `timestamp` was parsed in the _host_ timezone (a 7-hour
+   lie on this machine), `date` shifted a calendar day, `interval` became `{days:1,hours:2,…}`, and
+   `json` was parsed and re-stringified. All eight types now keep the server's own text or a
+   deterministic UTC reading.
+6. **`count(*)` over an arbitrary statement was removed.** It re-executes the user's query, so opening
+   a result tab on an expensive statement would run it a second time on somebody's production database
+   unasked. Browse mode counts the table; a cursor learns its exact count when it reaches the end and
+   reports `-1` until then. `countSql` and its three passing tests were **deleted**, not weakened.
+7. **The eager prefetch was being thrown away.** `run()` fetched 200 rows for the column metadata and
+   dropped them, so the first `window({startRow: 0})` was a _backward_ jump — a re-declare, i.e. a
+   second full execution of the query. The prefetch is now served (any window inside it) and its bytes
+   are returned to the registry once a request moves past it.
+8. **An injected `ResultRegistry` leaked pool clients.** Eviction is what closes a cursor and releases
+   its client, and that cleanup was wired through `onEvict` at construction — so a caller-supplied
+   registry carried the caller's callback and every eviction dropped a client. Surfaced as
+   "timeout exceeded when trying to connect" after a dozen results. `QueryService` now takes
+   `limits`, not a registry: bounds are injectable, ownership is not.
+9. **`EPIPE` and `EPERM` have the SQLSTATE shape.** Five characters of `[0-9A-Z]`, on the same `.code`
+   property `pg` uses — so a dead socket was reported as a server error. Disambiguated by the `E`
+   prefix: every Node errno starts with it, no Postgres SQLSTATE class does.
+10. **`quoteIdent`'s allowlist in §5.6 would break real databases.** Rejecting everything outside
+    `[A-Za-z0-9_$]` makes `Mixed Case`, `has space`, `with"dquote` and `unicode_ünïcødé` unbrowsable —
+    all four exist in the fixtures and all four round-trip now. Split into `quoteIdent` (always
+    quotes, doubles `"`, refuses NUL and >63 **bytes**) for names that came from somewhere, and
+    `isGeneratedName` (the allowlist) for names Tabby invents.
+
+**Also worth recording:** `pg_cancel_backend` needs the pid of the _specific_ backend running the
+query, so it is read once per acquired client rather than per fetch. `idle_in_transaction_session_timeout`
+(60s) is shorter than the registry TTL (10 min), so a cursor result can die of idleness first; that
+surfaces as `CURSOR_CLOSED` ("re-run the query") and browse mode is immune because it holds no
+transaction. And the cancellation fixture could not be a SQL function: returning a set lets Postgres
+materialise the body, so the first `FETCH` waited for all 1000 sleeps. `pg_sleep` in the target list
+of a plain query streams correctly.
+
+**Not done in Phase 4:** `RowIdentityResolver` and `ChangeBuffer` are declared in
+`src/shared/domain.ts` and nothing more, as specified — `paginationKeyFor` is a _paging_ decision and
+deliberately not the row-identity resolver. There is no UI yet: the renderer still shows the synthetic
+1M-row grid, and wiring `RemoteDataSource` to these channels is Phase 5. Coverage remains unmeasured
+(no coverage provider installed).
+
+### Phase 5 — Grid on live data · 5 days · ◄── NEXT
 
 **Goal:** swap `FakeDataSource` for the IPC-backed one without touching grid code.
 
@@ -462,10 +545,18 @@ run. macOS full-screen _restore_ is implemented but has not been exercised by a 
 
 ### Phase 10 — v2 groundwork
 
-> **Status check before starting:** as of Phase 2 completion there is **no editing code anywhere** —
-> a grep of `src/**/*.ts` for `RowIdentityResolver|ChangeBuffer|RowKey|beginEdit|commitEdit|setCell|editable`
-> returns zero matches. `ARCHITECTURE.md` §6 is _design only_. Phase 4 now carries the explicit
-> line item to declare those two types; everything beyond declarations lands here.
+> **Status check before starting (updated at Phase 4 completion):** there is still **no editing
+> behaviour anywhere** — a grep of `src/**` for `beginEdit|commitEdit|setCell|editable` returns zero
+> matches, verified. What Phase 4 added is declarations only: `RowKey`, `RowIdentityResolver`,
+> `Change` and `ChangeBuffer` at the bottom of `src/shared/domain.ts`, plus the catalog inputs they
+> will need (`TableMeta.primaryKey`, `TableMeta.uniqueIndexes` with an `allColumnsNotNull` flag).
+> Everything beyond those declarations lands here.
+>
+> Two things to check first, because Phase 4 deliberately did not decide them:
+> `SchemaService.paginationKeyFor()` already picks a key for **paging** and rejects a nullable unique
+> index for the right reason — but it is not `RowIdentityResolver.resolve()`, and the resolver must
+> not simply call it. And `default_transaction_read_only` is currently applied per **backend** in
+> `session.ts`; lifting it per-transaction means that module and its tests change.
 
 - Implement the editing layer against the types declared in Phase 4: `RowIdentityResolver` (PK/unique detection), `ChangeBuffer` (dirty rows, optimistic concurrency), staged-changes review + commit UI
 - Grid side, all additive: a mutable `DataSource` variant with a write method, an `editable`/`readOnly` flag on `ColumnSpec`, `beginEdit`/`commitEdit`/`cancelEdit` on `SelectionEvent`, and a real editor on the existing `overlay` layer (today that layer only draws the column-resize guide)

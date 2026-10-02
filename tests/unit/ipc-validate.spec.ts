@@ -161,6 +161,64 @@ describe('SQL-bearing fields', () => {
     expect(() => validateQueryRun({ connectionId: 'c1', sql: '' })).toThrow(/sql/);
   });
 
+  it('accepts an optional browse target of two identifiers', () => {
+    // Present only when the statement is a plain table scan, so main can page
+    // without holding a transaction open.
+    expect(
+      validateQueryRun({
+        connectionId: 'c1',
+        sql: 'select * from fixtures.big',
+        browse: { schema: 'fixtures', table: 'big' },
+      }).browse,
+    ).toEqual({ schema: 'fixtures', table: 'big' });
+  });
+
+  it('omits the browse key entirely when it was not sent', () => {
+    expect('browse' in validateQueryRun({ connectionId: 'c1', sql: 'select 1' })).toBe(false);
+  });
+
+  it('rejects a browse target that is not exactly two identifiers', () => {
+    expect(() =>
+      validateQueryRun({ connectionId: 'c1', sql: 'select 1', browse: { schema: 's' } }),
+    ).toThrow(/browse/);
+    expect(() =>
+      validateQueryRun({
+        connectionId: 'c1',
+        sql: 'select 1',
+        browse: { schema: 's', table: 't', extra: 1 },
+      }),
+    ).toThrow(/browse/);
+    expect(() =>
+      validateQueryRun({ connectionId: 'c1', sql: 'select 1', browse: 'fixtures.big' }),
+    ).toThrow(/browse/);
+    expect(() =>
+      validateQueryRun({ connectionId: 'c1', sql: 'select 1', browse: { schema: '', table: 't' } }),
+    ).toThrow(/browse/);
+  });
+
+  it('rejects control characters and NUL bytes in a browse identifier', () => {
+    expect(() =>
+      validateQueryRun({
+        connectionId: 'c1',
+        sql: 'select 1',
+        browse: { schema: 's\u0000', table: 't' },
+      }),
+    ).toThrow(/browse\.schema/);
+    expect(() =>
+      validateQueryRun({
+        connectionId: 'c1',
+        sql: 'select 1',
+        browse: { schema: 's', table: 'a\tb' },
+      }),
+    ).toThrow(/browse\.table/);
+  });
+
+  it('still refuses unknown top-level keys on a query run', () => {
+    expect(() => validateQueryRun({ connectionId: 'c1', sql: 'select 1', browse: null })).toThrow(
+      /browse/,
+    );
+  });
+
   it('allows an identifier to contain a quote, because quoting is quoteIdent’s job', () => {
     // Postgres permits `we"ird` as a quoted identifier. Rejecting it here would
     // make such a table unbrowsable; the boundary checks shape and bounds, and

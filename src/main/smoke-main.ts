@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { applySecurityGuards, type CspProfile } from './security/navigation';
 import { registerIpcHandlers } from './ipc/router';
+import { createDbServices } from './db/services';
 import { SettingsStore } from './store/settings-store';
 import type { SecretCipher } from './store/cipher';
 
@@ -120,7 +121,16 @@ app
     });
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
-    const disposeIpc = registerIpcHandlers({ settings, window: () => win });
+    // The same object graph the real app builds, so the harness cannot pass on a
+    // wiring the shipped binary does not use. `emit` is dropped: the harness polls.
+    const db = createDbServices({ settings, emit: () => undefined });
+    const disposeIpc = registerIpcHandlers({
+      settings,
+      window: () => win,
+      connections: db.connections,
+      schemas: db.schemas,
+      queries: db.queries,
+    });
 
     await win.loadURL(target);
     // The document must hold focus or Chromium rejects clipboard writes.
@@ -376,9 +386,18 @@ app
     }
     out.protoPolluted = ({}).x !== undefined;
 
-    // An unimplemented channel must answer with a typed error, not throw.
-    const pending = await db.queryCancel('r1');
-    out.unimplementedCode = pending.ok === false ? pending.error.code : 'ACCEPTED';
+    // Channels with nothing behind them must still answer with a typed error and
+    // never throw: the harness runs with no database, so every Phase 4 handler is
+    // reachable here and has to fail cleanly rather than reject across the bridge.
+    const unknownResult = await db.queryCancel('r1');
+    out.unknownResultCode = unknownResult.ok === false ? unknownResult.error.code : 'ACCEPTED';
+
+    const unknownConnection = await db.schemaChildren({ connectionId: 'nope', parentSchema: null });
+    out.unknownConnectionCode =
+      unknownConnection.ok === false ? unknownConnection.error.code : 'ACCEPTED';
+
+    const unopenedQuery = await db.queryRun({ connectionId: 'nope', sql: 'select 1' });
+    out.unopenedQueryCode = unopenedQuery.ok === false ? unopenedQuery.error.code : 'ACCEPTED';
 
     // Deletion is tested in a second pass, after main has read the settings file
     // off disk — deleting here first would make the ciphertext check vacuous.
@@ -405,6 +424,9 @@ app
   })()`)) as { deleteOk: boolean; deleteMissingCode: string };
 
     disposeIpc();
+    // No session was ever opened (the harness has no database), but disposing is
+    // what the real app does on quit and must not throw when there is nothing open.
+    await db.dispose();
     rmSync(settingsDir, { recursive: true, force: true });
 
     const steps = interaction.steps ?? {};
@@ -535,8 +557,16 @@ app
       ['connection deleted', deletion.deleteOk === true],
       ['deleting twice reports NOT_FOUND', deletion.deleteMissingCode === 'NOT_FOUND'],
       [
-        'unimplemented channel answers with a typed error',
-        ipc.unimplementedCode === 'NOT_CONNECTED',
+        'an unknown result id answers RESULT_NOT_FOUND, not a throw',
+        ipc.unknownResultCode === 'RESULT_NOT_FOUND',
+      ],
+      [
+        'an unknown connection id answers NOT_FOUND, not a throw',
+        ipc.unknownConnectionCode === 'NOT_FOUND',
+      ],
+      [
+        'a query on an unopened connection answers NOT_FOUND, not a throw',
+        ipc.unopenedQueryCode === 'NOT_FOUND',
       ],
       [
         'no channel threw across the bridge',

@@ -4,6 +4,9 @@ import { IpcChannel, type SettingsSnapshot } from '../../shared/ipc-contract';
 import type { WindowState } from '../../shared/domain';
 import { logError, logInfo, logRejectedPayload } from '../log';
 import type { SettingsStore } from '../store/settings-store';
+import type { ConnectionManager } from '../db/connection-manager';
+import type { QueryService } from '../db/query-service';
+import type { SchemaService } from '../db/schema-service';
 import {
   ValidationError,
   validateConnSave,
@@ -20,6 +23,9 @@ import {
 export interface RouterServices {
   readonly settings: SettingsStore;
   readonly window: () => BrowserWindow | null;
+  readonly connections: ConnectionManager;
+  readonly schemas: SchemaService;
+  readonly queries: QueryService;
 }
 
 const SCOPE = 'ipc';
@@ -132,32 +138,61 @@ export function registerIpcHandlers(services: RouterServices): () => void {
     return result;
   });
 
-  handle(IpcChannel.connDelete, validateConnectionId, (connectionId) =>
-    services.settings.deleteConnection(connectionId),
+  handle(IpcChannel.connDelete, validateConnectionId, (connectionId) => {
+    // Dropping the stored connection cannot leave a live session behind: it would
+    // keep a pool — and an xmin horizon on the server — for a connection the user
+    // believes is gone.
+    const stored = services.settings.deleteConnection(connectionId);
+    if (stored.ok) void services.connections.close(connectionId);
+    return stored;
+  });
+
+  handle(IpcChannel.connTest, validateConnectionId, (connectionId) =>
+    services.connections.test(connectionId),
   );
 
-  // Channels whose handlers land in Phase 4. They are validated *now*, not
-  // later: an unimplemented handler that skips validation would accept any
-  // payload a compromised renderer sends, and Phase 4 would then have to
-  // remember to add the guard. Validating here means the swap is a handler body,
-  // not a rewiring — and a hostile payload is rejected and logged today.
-  const pending =
-    (channel: string): Handler<unknown> =>
-    () =>
-      err({ code: 'NOT_CONNECTED', message: `${channel} is not implemented until Phase 4` });
+  handle(IpcChannel.connOpen, validateConnectionId, async (connectionId) => {
+    const opened = await services.connections.open(connectionId);
+    // The renderer gets nothing back but success: a PgSession is a live socket and
+    // must never cross the bridge.
+    return opened.ok ? ok(undefined) : err<void>(opened.error);
+  });
 
-  handle(IpcChannel.connTest, validateConnectionId, pending(IpcChannel.connTest));
-  handle(IpcChannel.connOpen, validateConnectionId, pending(IpcChannel.connOpen));
-  handle(IpcChannel.connClose, validateConnectionId, pending(IpcChannel.connClose));
-  handle(IpcChannel.schemaChildren, validateSchemaChildren, pending(IpcChannel.schemaChildren));
-  handle(IpcChannel.schemaTable, validateSchemaTable, pending(IpcChannel.schemaTable));
-  handle(IpcChannel.schemaRefresh, validateConnectionId, pending(IpcChannel.schemaRefresh));
-  handle(IpcChannel.queryRun, validateQueryRun, pending(IpcChannel.queryRun));
-  handle(IpcChannel.queryCancel, validateResultId, pending(IpcChannel.queryCancel));
-  handle(IpcChannel.resultMeta, validateResultId, pending(IpcChannel.resultMeta));
-  handle(IpcChannel.resultWindow, validateResultWindow, pending(IpcChannel.resultWindow));
-  handle(IpcChannel.resultSort, validateResultSort, pending(IpcChannel.resultSort));
-  handle(IpcChannel.resultDispose, validateResultId, pending(IpcChannel.resultDispose));
+  handle(IpcChannel.connClose, validateConnectionId, async (connectionId) => {
+    services.queries.dropConnection(connectionId);
+    services.schemas.dropConnection(connectionId);
+    return services.connections.close(connectionId);
+  });
+
+  // ── Schema ─────────────────────────────────────────────────────────────────
+  handle(IpcChannel.schemaChildren, validateSchemaChildren, (request) =>
+    services.schemas.childrenOf(request.connectionId, request.parentSchema),
+  );
+
+  handle(IpcChannel.schemaTable, validateSchemaTable, (request) =>
+    services.schemas.tableOf(request.connectionId, request.schema, request.table),
+  );
+
+  handle(IpcChannel.schemaRefresh, validateConnectionId, (connectionId) =>
+    ok(services.schemas.refresh(connectionId)),
+  );
+
+  // ── Queries and results ────────────────────────────────────────────────────
+  handle(IpcChannel.queryRun, validateQueryRun, (request) => services.queries.run(request));
+
+  handle(IpcChannel.queryCancel, validateResultId, (resultId) => services.queries.cancel(resultId));
+
+  handle(IpcChannel.resultMeta, validateResultId, (resultId) => services.queries.meta(resultId));
+
+  handle(IpcChannel.resultWindow, validateResultWindow, (request) =>
+    services.queries.window(request),
+  );
+
+  handle(IpcChannel.resultSort, validateResultSort, (request) => services.queries.sort(request));
+
+  handle(IpcChannel.resultDispose, validateResultId, (resultId) =>
+    services.queries.dispose(resultId),
+  );
 
   logInfo(SCOPE, `registered ${registered.length} channels`);
 

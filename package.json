@@ -21,6 +21,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:pg": "vitest run tests/integration",
+    "pg:fixtures": "psql -h ${TABBY_TEST_PG_HOST:-localhost} -p ${TABBY_TEST_PG_PORT:-5432} -U ${TABBY_TEST_PG_USER:?set TABBY_TEST_PG_USER} -d ${TABBY_TEST_PG_DATABASE:?set TABBY_TEST_PG_DATABASE} -v ON_ERROR_STOP=1 -f scripts/pg-fixtures.sql",
     "deps:check": "node scripts/check-deps.mjs",
     "smoke": "electron-vite build && electron out/main/smoke-main.js",
     "smoke:dev": "electron-vite build && TABBY_SMOKE_CSP=dev electron out/main/smoke-main.js",
