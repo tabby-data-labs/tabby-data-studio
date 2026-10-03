@@ -22,7 +22,7 @@ import {
   assertGeneratedName,
   quoteIdent,
   quoteQualified,
-} from './ident';
+} from '../../shared/ident';
 import { assertSingleStatement } from './sql-scan';
 
 /** Mirrors the IPC layer's `MAX_WINDOW_ROWS`: one window request cannot ask for more. */

@@ -46,7 +46,6 @@ tabby/
 │  │  │  ├─ result-sql.ts        # cursor, keyset and OFFSET statement builders
 │  │  │  ├─ introspect.ts        # pg_catalog queries + row mappers
 │  │  │  ├─ sql-scan.ts          # Postgres lexical scanner (single-statement proof)
-│  │  │  ├─ ident.ts             # quoteIdent / isGeneratedName
 │  │  │  ├─ session.ts           # the SET statements applied to every backend
 │  │  │  ├─ pg-config.ts         # StoredConnection → pool config, SSL mapping
 │  │  │  ├─ pg-error.ts          # SQLSTATE + errno → TabbyError
@@ -61,16 +60,18 @@ tabby/
 │  │  └─ src/
 │  │     ├─ main.ts
 │  │     ├─ app/                  # shell, routing, layout
-│  │     ├─ components/           # SchemaTree, QueryConsole, ResultTabs…
+│  │     ├─ components/           # ConnectionBar, QueryBar, ResultStatus, TabBar…
+│  │     ├─ data/                 # RemoteDataSource, and the invoke() wrapper
 │  │     ├─ grid/                 # ◄── see GRID-SPEC.md; imports nothing above
 │  │     ├─ sql/                  # lexer, splitter, highlighter (Phase 7)
-│  │     ├─ stores/               # pinia
+│  │     ├─ stores/               # pinia: tabs, connections, results
 │  │     └─ styles/
 │  └─ shared/                     # imported by ALL THREE processes
-│     ├─ ipc-contract.ts          # channel names + request/response types
+│     ├─ ipc-contract.ts          # channel names, request/response types, MainEventMap
 │     ├─ domain.ts                # StoredConnection, TableMeta, EncodedRowBlock…
 │     ├─ columnar.ts              # the transfer codec: main encodes, renderer decodes
 │     ├─ pg-types.ts              # OID table, encoding choice, value normalisation
+│     ├─ ident.ts                 # quoteIdent — main quotes, renderer builds browse SQL
 │     └─ errors.ts                # tagged error union
 └─ tests/
    ├─ unit/
@@ -169,13 +170,41 @@ export interface DataSource {
 
 Three implementations, all satisfying the same contract:
 
-| Implementation       | Used in               | Notes                                                                                    |
-| -------------------- | --------------------- | ---------------------------------------------------------------------------------------- |
-| `FakeDataSource`     | Phase 1–2, unit tests | Deterministic 1M×30 synthetic rows. Lets the grid be finished before any DB code exists. |
-| `RemoteDataSource`   | Phase 5+              | Wraps IPC; read-ahead prefetch, in-flight dedupe, stale-response abort.                  |
-| `InMemoryDataSource` | Small results, tests  | Whole result already local.                                                              |
+| Implementation       | Used in              | Notes                                                                                    |
+| -------------------- | -------------------- | ---------------------------------------------------------------------------------------- |
+| `FakeDataSource`     | unit tests, demo tab | Deterministic 1M×30 synthetic rows. Lets the grid be finished before any DB code exists. |
+| `RemoteDataSource`   | Phase 5+             | Wraps IPC. Owns retry/backoff and terminal states — see the correction below.            |
+| `InMemoryDataSource` | Small results, tests | Whole result already local. Not built yet; nothing has needed it.                        |
 
-Phase 5's exit criterion is that the grid's own API and tests do **not** change when `Fake` is swapped for `Remote`. If they do, the boundary was wrong — fix the boundary, not the grid.
+Phase 5's exit criterion was that the grid's own API and tests do **not** change when `Fake` is swapped for `Remote`. It held: `git diff --stat HEAD -- src/renderer/src/grid tests/unit/grid-*.spec.ts` is empty. If a future change needs the grid to move, that is the signal the boundary was wrong — fix the boundary, not the grid.
+
+> **Correction (Phase 5): the prefetch/dedupe/abort row above was wrong.**
+>
+> This section described `RemoteDataSource` as owning "read-ahead prefetch, in-flight
+> dedupe, stale-response abort". All three already lived in the grid's
+> `DataWindowController`, built in Phase 1, and they _must_ stay there — it is the only
+> component that knows the visible range. A second copy in the source would mean two
+> components racing to decide what to fetch. So `getBlock` is one honest request per
+> call. "Loading skeletons" were likewise already done: `paint.ts` draws
+> `theme.placeholder` for any cell the cache does not have.
+>
+> What the grid genuinely cannot own is **retry policy**. `DataWindowController.request()`
+> re-asks for any block that is neither cached nor in flight, and `update()` runs every
+> frame — so a range that fails permanently is re-requested 60 times a second, forever.
+> Against a server that has gone away that is a retry storm the user can neither see nor
+> stop. `RemoteDataSource` therefore owns backoff (250ms → 8s, five attempts, per range),
+> and four **terminal** states in which no retry can help — evicted, cursor closed,
+> cancelled, connection lost — after which it stops calling the bridge entirely.
+>
+> Two smaller things worth recording, because both were invisible until something needed
+> them:
+>
+> - The grid reads `source.rowCount` and `source.columns` on every frame, so they are
+>   getters, not snapshots. A background `count(*)` landing only has to update the source
+>   and call `invalidate()`.
+> - `run()` prefetches rows eagerly to learn the column metadata. Those rows are kept and
+>   served to the first windows; discarding them would make the first
+>   `getBlock(0, …)` a _backward_ jump, which on a cursor means re-running the query.
 
 ---
 

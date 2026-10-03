@@ -35,24 +35,25 @@ learn from.
 
 ## Status
 
-**Phases 0–4 complete** — a hardened Electron shell, a from-scratch canvas data grid that scrolls
+**Phases 0–5 complete** — a hardened Electron shell, a from-scratch canvas data grid that scrolls
 **1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel (pointer and keyboard
 selection, five clipboard formats, context menu, cell inspector, ARIA proxy grid), a validated
-three-process IPC contract with keychain-encrypted credentials, and a **real Postgres data layer**
-verified against a live PostgreSQL 18 server. The renderer still shows the synthetic grid; Phase 5
-swaps in the IPC-backed `DataSource`.
+three-process IPC contract with keychain-encrypted credentials, a **real Postgres data layer**
+verified against live PostgreSQL 18, and that data layer now **drives the grid**: pick a connection,
+browse a table, scroll 10M rows at 60fps.
 
 | Check                         | Result                                                                                                                                                       |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                                                                           |
 | `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                                                                      |
 | `npm run typecheck`           | ✅ node + web projects                                                                                                                                       |
-| `npm test`                    | ✅ **889 tests**, 32 files (the 44 integration tests skip when no database is configured)                                                                    |
+| `npm test`                    | ✅ **954 tests**, 34 files (the 44 integration tests skip when no database is configured)                                                                    |
 | `npm run test:pg`             | ✅ **44 tests** against live PostgreSQL 18.6 — read-only enforcement, cursor jumps, cancellation, type fidelity, catalog reads, registry soak                |
 | `npm run build`               | ✅ main (3 entries) · preload · renderer                                                                                                                     |
 | `npm run smoke` (prod CSP)    | ✅ **61/61 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav, copy, IPC round-trip, 8/8 hostile payloads rejected, clean typed errors |
 | `npm run smoke:dev` (dev CSP) | ✅ **61/61** — both correctly **allowed** under the dev policy                                                                                               |
-| `npm run bench`               | ✅ p50 2.60 · **p95 3.40ms** vs 10ms budget · **60.0 fps** · 1 dropped in 599 · 0 measureText misses                                                         |
+| `npm run smoke` + a database  | ✅ **74/74** — adds 13 assertions that the columnar block survives _Electron's_ serializer with its typed arrays intact                                      |
+| `npm run bench`               | ✅ synthetic 1M×30: p95 **3.90ms** · live 200k×17: p95 **3.70ms** · live 10M×4: p95 **2.00ms** — all **60.0 fps**, 10ms budget                               |
 
 Runtime confirmed as **Electron 44.4.5 / Chromium 152.0.7977.130 / Node 24.21.0**, with no
 `require`, `process`, `Buffer`, or `ipcRenderer` leaking into the renderer, `window.tabby` frozen,
@@ -68,14 +69,23 @@ suite asserts that `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` and `TRUNCATE`
 SQLSTATE `25006`. Measured against a 10M-row / 789 MB table: first 1000 rows in **19.1ms**, a forward
 jump to row 800,000 in **63ms**, a backward jump in **1.1ms**, `pg_cancel_backend` in **2.8ms**.
 
-The grid is 22 modules / ~5,000 lines in `src/renderer/src/grid/`, importing nothing from the app —
-enforced by an ESLint boundary rule so it stays headlessly testable and extractable. `pg` is imported
-by exactly one file, `src/main/db/driver-pg.ts`, enforced the same way.
+**The grid boundary held.** Phase 5 swapped the synthetic source for an IPC-backed one without
+changing a byte of the grid: `git diff --stat HEAD -- src/renderer/src/grid tests/unit/grid-*.spec.ts`
+is empty. The 22 modules / ~5,000 lines in `src/renderer/src/grid/` import nothing from the app —
+enforced by an ESLint rule — and `pg` is imported by exactly one file, `src/main/db/driver-pg.ts`,
+enforced the same way.
+
+What the grid could _not_ own turned out to be retry policy: `DataWindowController` re-requests any
+block that is neither cached nor in flight, every frame, so a permanently failing range would be
+re-requested 60 times a second forever. `RemoteDataSource` holds the backoff (250ms → 8s, five
+attempts) and the terminal states — evicted, cancelled, cursor closed, connection lost — and the UI
+offers an explicit Retry rather than hammering a server that has gone away.
 
 **Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy, macOS full-screen
-restore, text crispness when dragging to a different-DPI monitor, and clicking around a live query
-result in the UI — there is no result UI yet. All are implemented and asserted structurally in code,
-but need eyes.
+restore, text crispness when dragging to a different-DPI monitor, and — new in Phase 5 — actually
+sitting in front of a live result and scrolling it. The bench and smoke harnesses drive the real DOM
+against a real database, which proves the wiring and the frame budget, but not the feel. All are
+implemented and asserted structurally in code; they need eyes.
 
 ## Getting started
 
@@ -112,6 +122,17 @@ export TABBY_TEST_PG_DATABASE=tabby-data-test
 npm run pg:fixtures                     # idempotent: 10M rows + type/identity/identifier fixtures
 npm run test:pg
 TABBY_REPORT_PERF=1 npm run test:pg     # also print the measured latencies
+```
+
+The same variables switch on the **live sections of the two Electron harnesses**, which are otherwise
+database-free:
+
+```bash
+npm run smoke                            # +13 assertions: the columnar block survives Electron's
+                                         #  serializer with its typed arrays intact, decoded by hand
+                                         #  in the renderer
+npm run bench                            # drives the real UI — connection picker, browse box — then
+TABBY_BENCH_TABLE=fixtures.wide npm run bench   # benches the live table instead of the synthetic one
 ```
 
 Credentials come from the environment only — nothing in this repository contains a password, and the

@@ -4,7 +4,12 @@
  * Imported by the preload (to build the object), by the renderer (to type
  * `window.tabby`), and by tests. No runtime imports — this is types only.
  */
-import type { DatabaseApi, QueryProgressEvent } from './ipc-contract';
+import type {
+  ConnectionLostEvent,
+  DatabaseApi,
+  QueryProgressEvent,
+  ResultEvictedEvent,
+} from './ipc-contract';
 
 export interface TabbyVersions {
   readonly electron: string;
@@ -18,10 +23,15 @@ export interface TabbyVersions {
  */
 export type Unsubscribe = () => void;
 
+/**
+ * Listener payloads come from `MainEventMap` in the IPC contract, so main and the
+ * renderer cannot drift apart silently. They used to: main emitted
+ * `{ connectionId }` while this declared a bare `string`.
+ */
 export interface TabbyEvents {
   onQueryProgress(listener: (event: QueryProgressEvent) => void): Unsubscribe;
-  onConnectionLost(listener: (connectionId: string) => void): Unsubscribe;
-  onResultEvicted(listener: (resultId: string) => void): Unsubscribe;
+  onConnectionLost(listener: (event: ConnectionLostEvent) => void): Unsubscribe;
+  onResultEvicted(listener: (event: ResultEvictedEvent) => void): Unsubscribe;
 }
 
 export interface TabbyApi {

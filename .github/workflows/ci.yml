@@ -109,3 +109,12 @@ jobs:
 
       - name: Integration tests (live Postgres 18)
         run: npm run test:pg
+
+      # The same Electron harness the verify job runs, but with the database
+      # configured — which switches on its live section. That section is the only
+      # thing in the repo that proves the columnar payload survives *Electron's*
+      # serializer rather than Node's structuredClone: it decodes the raw bytes by
+      # hand in the renderer and checks the typed arrays are still typed arrays.
+      # xvfb because Electron needs a display even when nothing is watched.
+      - name: Smoke with live data (columnar over real IPC)
+        run: xvfb-run -a npm run smoke

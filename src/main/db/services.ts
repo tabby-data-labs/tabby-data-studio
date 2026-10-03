@@ -7,6 +7,7 @@
  * configuration from the one that ships.
  */
 import type { StoredConnection } from '../../shared/domain';
+import type { MainEventEmitter } from '../../shared/ipc-contract';
 import type { SettingsStore } from '../store/settings-store';
 import { ConnectionManager } from './connection-manager';
 import { createPgDriver } from './driver-pg';
@@ -16,8 +17,8 @@ import type { SessionLimits } from './session';
 
 export interface DbServicesDeps {
   readonly settings: SettingsStore;
-  /** main → renderer events. Ignored by the harness, which polls instead. */
-  readonly emit: (channel: string, payload: unknown) => void;
+  /** main → renderer events. The harness passes a recorder instead of a window. */
+  readonly emit: MainEventEmitter;
   readonly limits?: Partial<SessionLimits>;
 }
 
@@ -45,6 +46,14 @@ export function createDbServices(deps: DbServicesDeps): DbServices {
     connections,
     schemas,
     queries,
-    dispose: () => connections.closeAll(),
+    dispose: async () => {
+      // Order matters. A live result holds a checked-out pool client for its whole
+      // life, and `pool.end()` waits for every client to come back — so closing
+      // connections first would block until a grace timer force-exited the process.
+      // Draining the registry, then awaiting the releases, makes shutdown prompt.
+      queries.registry.clear();
+      await queries.drain();
+      await connections.closeAll();
+    },
   };
 }

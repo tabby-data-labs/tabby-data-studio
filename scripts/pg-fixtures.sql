@@ -35,6 +35,64 @@ begin
 end
 $do$;
 
+-- ── A wide, scrollable table ─────────────────────────────────────────────────
+-- `fixtures.big` is 10M rows but only four columns, so benching against it paints
+-- far fewer cells than a real result and flatters the frame time. This one is the
+-- shape a live grid actually has to scroll: enough rows to keep fetching, wide
+-- enough to matter, every encoding the codec has (float64, bit-packed bool, UTF-8
+-- blob), and NULLs sprinkled in so the null bitmap is exercised too.
+--
+--   TABBY_BENCH_TABLE=fixtures.wide npm run bench
+
+create table if not exists fixtures.wide (
+  id  bigint primary key,
+  c01 integer,
+  c02 bigint,
+  c03 numeric(18, 4),
+  c04 real,
+  c05 double precision,
+  c06 boolean,
+  c07 text,
+  c08 varchar(64),
+  c09 char(8),
+  c10 jsonb,
+  c11 bytea,
+  c12 date,
+  c13 timestamp,
+  c14 timestamptz,
+  c15 uuid,
+  c16 interval
+);
+
+comment on table fixtures.wide is '17 columns × 200k rows, for the live scroll benchmark';
+
+do $do$
+begin
+  if not exists (select 1 from fixtures.wide limit 1) then
+    insert into fixtures.wide
+    select g,
+           case when g % 11 = 0 then null else (g % 97)::integer end,
+           (g * 7)::bigint,
+           (g % 10000)::numeric / 4,
+           (g % 1000)::real / 3,
+           (g % 1000)::double precision / 7,
+           (g % 2 = 0),
+           'label-' || g || '-' || md5(g::text),
+           left(md5(g::text), 24),
+           left(md5(g::text), 8),
+           jsonb_build_object('id', g, 'tag', left(md5(g::text), 8)),
+           decode(left(md5(g::text), 16), 'hex'),
+           date '2020-01-01' + (g % 2000),
+           timestamp '2020-01-01 00:00:00' + (g % 86400) * interval '1 second',
+           timestamptz '2020-01-01 00:00:00+00' + (g % 86400) * interval '1 second',
+           ('00000000-0000-0000-0000-' || left(md5(g::text), 12))::uuid,
+           (g % 3600) * interval '1 second'
+    from generate_series(1, 200000) as g;
+    analyze fixtures.wide;
+  end if;
+end
+$do$;
+
 -- ── Row identity: the four shapes the resolver must distinguish ───────────────
 
 -- No PK, no unique index at all → not addressable, resolve() must return null.

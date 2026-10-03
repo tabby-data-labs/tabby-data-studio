@@ -812,6 +812,16 @@ describe.skipIf(!pgConfigured)('live postgres · registry memory cap soak', () =
     // "result expired — re-run query" instead of showing blank cells.
     const evicted = h.events.filter((event) => event.channel === 'event:result-evicted');
     expect(evicted.length).toBeGreaterThan(0);
+
+    // Payload shape pinned at runtime. `TabbyEvents` and main's emitter were once
+    // typed independently and disagreed — main sent `{resultId, reason}` while the
+    // preload declared a bare `string`. Both now derive from `MainEventMap`; this
+    // is the assertion that catches a regression the compiler could not.
+    for (const event of evicted) {
+      const payload = event.payload as { resultId?: unknown; reason?: unknown };
+      expect(typeof payload.resultId).toBe('string');
+      expect(['capacity', 'expired']).toContain(payload.reason);
+    }
     expect(registry.size()).toBeLessThanOrEqual(MAX_ENTRIES);
 
     const oldest = await h.queries.window({ resultId: ids[0]!, startRow: 0, rowCount: 10 });

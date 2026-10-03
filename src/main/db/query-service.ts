@@ -23,6 +23,7 @@ import { randomUUID } from 'node:crypto';
 import { err, ok, type Result } from '../../shared/errors';
 import {
   IpcChannel,
+  type MainEventEmitter,
   type QueryProgressEvent,
   type QueryRunRequest,
   type QueryRunResponse,
@@ -35,7 +36,7 @@ import { typeNameFor, widthHintFor } from '../../shared/pg-types';
 import { logError, logInfo } from '../log';
 import type { ConnectionManager } from './connection-manager';
 import type { PgClientHandle, PgQueryResult } from './driver-pg';
-import { IdentifierError, quoteIdent, quoteQualified } from './ident';
+import { IdentifierError, quoteIdent, quoteQualified } from '../../shared/ident';
 import { toTabbyError } from './pg-error';
 import { ResultRegistry, type EvictionReason } from './result-registry';
 import {
@@ -124,7 +125,8 @@ export interface ResultLimits {
 export interface QueryServiceDeps {
   readonly connections: ConnectionManager;
   readonly schemas: SchemaService;
-  readonly emit: (channel: string, payload: unknown) => void;
+  /** Typed per channel by `MainEventMap`, so a payload cannot drift from the preload. */
+  readonly emit: MainEventEmitter;
   readonly newResultId?: () => string;
   /**
    * Bounds for the registry, not a registry.
@@ -147,6 +149,8 @@ export class QueryService {
   private readonly evictedOrder: string[] = [];
   /** Tail of the background-count chain per connection. */
   private readonly countQueues = new Map<string, Promise<void>>();
+  /** In-flight cursor releases, so teardown can await them instead of racing. */
+  private readonly pendingReleases = new Set<Promise<void>>();
 
   constructor(deps: QueryServiceDeps) {
     this.deps = deps;
@@ -550,10 +554,28 @@ export class QueryService {
   }
 
   private onEvicted(state: LiveResult, reason: EvictionReason): void {
-    void this.releaseQuietly(state);
+    // Tracked, not fire-and-forget: a result holds a checked-out pool client for
+    // its whole life, and `pool.end()` waits for every client to come back. A
+    // teardown that does not await these blocks until something force-kills it.
+    const release = this.releaseQuietly(state);
+    this.pendingReleases.add(release);
+    void release.finally(() => this.pendingReleases.delete(release));
+
     if (reason === 'disposed') return;
     this.rememberEvicted(state.resultId);
     this.deps.emit(IpcChannel.evResultEvicted, { resultId: state.resultId, reason });
+  }
+
+  /**
+   * Awaits every in-flight cursor release.
+   *
+   * Call this before closing a connection or quitting. Without it `pool.end()`
+   * waits for clients that are still mid-`ROLLBACK`, which in the app meant
+   * shutdown always burned its grace period and exited by force whenever a result
+   * tab was open — and in the bench harness, hung forever.
+   */
+  async drain(): Promise<void> {
+    await Promise.allSettled([...this.pendingReleases]);
   }
 
   private rememberEvicted(resultId: string): void {

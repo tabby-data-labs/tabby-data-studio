@@ -1,6 +1,11 @@
 /**
  * Identifier quoting (PLAN Phase 4, ARCHITECTURE §5.6).
  *
+ * Lives in `src/shared` because both processes need it and they must agree: main
+ * quotes names on the way into a statement, and the renderer quotes them to build
+ * a "browse this table" query and, in Phase 6, to copy a qualified name. Two
+ * implementations would eventually disagree about what is safe.
+ *
  * Every object name that reaches the database came from either a catalog row or
  * the untrusted renderer. Both are treated the same way: always quote, double
  * any embedded `"`, and refuse the two things Postgres cannot represent — a NUL

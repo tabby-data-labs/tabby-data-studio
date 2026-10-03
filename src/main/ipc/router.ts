@@ -138,12 +138,18 @@ export function registerIpcHandlers(services: RouterServices): () => void {
     return result;
   });
 
-  handle(IpcChannel.connDelete, validateConnectionId, (connectionId) => {
+  handle(IpcChannel.connDelete, validateConnectionId, async (connectionId) => {
     // Dropping the stored connection cannot leave a live session behind: it would
     // keep a pool — and an xmin horizon on the server — for a connection the user
-    // believes is gone.
+    // believes is gone. Results are drained first, because each one holds a client
+    // and `pool.end()` waits for all of them.
     const stored = services.settings.deleteConnection(connectionId);
-    if (stored.ok) void services.connections.close(connectionId);
+    if (stored.ok) {
+      services.queries.dropConnection(connectionId);
+      await services.queries.drain();
+      services.schemas.dropConnection(connectionId);
+      await services.connections.close(connectionId);
+    }
     return stored;
   });
 
@@ -160,6 +166,9 @@ export function registerIpcHandlers(services: RouterServices): () => void {
 
   handle(IpcChannel.connClose, validateConnectionId, async (connectionId) => {
     services.queries.dropConnection(connectionId);
+    // Await the cursor releases before ending the pool, or `pool.end()` sits waiting
+    // for clients that are still mid-ROLLBACK.
+    await services.queries.drain();
     services.schemas.dropConnection(connectionId);
     return services.connections.close(connectionId);
   });

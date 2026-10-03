@@ -15,7 +15,7 @@ import {
   quoteIdent,
   quoteQualified,
   unquoteIdent,
-} from '../../src/main/db/ident';
+} from '../../src/shared/ident';
 
 describe('quoting', () => {
   it('always wraps in double quotes, even for a plain lowercase name', () => {

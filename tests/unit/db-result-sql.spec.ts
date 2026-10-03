@@ -26,7 +26,7 @@ import {
   selectFromTableSql,
 } from '../../src/main/db/result-sql';
 import { SqlStructureError, assertSingleStatement } from '../../src/main/db/sql-scan';
-import { isGeneratedName } from '../../src/main/db/ident';
+import { isGeneratedName } from '../../src/shared/ident';
 
 const CURSOR = 'tabby_c_r1';
 

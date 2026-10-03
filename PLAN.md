@@ -491,7 +491,7 @@ deliberately not the row-identity resolver. There is no UI yet: the renderer sti
 1M-row grid, and wiring `RemoteDataSource` to these channels is Phase 5. Coverage remains unmeasured
 (no coverage provider installed).
 
-### Phase 5 — Grid on live data · 5 days · ◄── NEXT
+### Phase 5 — Grid on live data · ✅ COMPLETE (2026-10-02)
 
 **Goal:** swap `FakeDataSource` for the IPC-backed one without touching grid code.
 
@@ -502,7 +502,89 @@ deliberately not the row-identity resolver. There is no UI yet: the renderer sti
 
 **Exit criteria:** the grid module's public API and its unit tests are **unchanged** from Phase 2 — proof the boundary held. Fast-scrolling a 10M-row table shows placeholders, never wrong data, and never blocks the main thread.
 
-### Phase 6 — Schema explorer · 5 days
+#### Result
+
+| Exit criterion                                                             | Result                                                                                                                                                                                                        |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Grid public API and unit tests unchanged                                   | ✅ **Proven, not asserted:** `git diff --stat HEAD -- src/renderer/src/grid tests/unit/grid-*.spec.ts tests/unit/helpers` is **empty**. 22 grid modules and 17 grid spec files are byte-identical to Phase 2. |
+| Fast-scrolling a large table: placeholders, never wrong data, never blocks | ✅ Measured through the **real UI** against live Postgres — the bench harness drives the connection picker and the browse box, then clicks the same button a user would. See the two runs below.              |
+
+Live scroll benchmarks (`npm run bench` with `TABBY_TEST_PG_*` set), each 599 frames:
+
+| Source                                         | p50    | p95        | p99    | fps   | dropped | measureText |
+| ---------------------------------------------- | ------ | ---------- | ------ | ----- | ------- | ----------- |
+| `fixtures.big` — 10M rows × 4 cols (browse)    | 1.70ms | **2.00ms** | 2.20ms | 60.00 | 1       | 67,084      |
+| `fixtures.wide` — 200k rows × 17 cols (browse) | 3.00ms | **3.70ms** | 4.40ms | 60.00 | 1       | 508,188     |
+| synthetic — 1M rows × 30 cols (no database)    | 2.50ms | **3.90ms** | 5.20ms | 60.01 | 1       | 283,907     |
+
+The 17-column live run is the honest one: it includes an IPC round trip, a
+`FETCH`/keyset seek against Postgres, and a columnar decode per block, _while_
+painting at 60fps. It lands at p95 3.70ms against a 10ms budget — comparable to
+the synthetic grid that touches no database at all.
+
+Gate: `npm run verify` ✅ (deps `pg` only · prettier clean · lint 0/0 · typecheck ·
+**954 unit tests** · build) · `npm run test:pg` ✅ **44 integration** · `npm run smoke`
+and `smoke:dev` ✅ **61/61** · `npm run smoke` with a database ✅ **74/74** ·
+`npm run bench` ✅ synthetic and both live configurations.
+
+Delivered: `src/renderer/src/data/{remote-source,ipc}.ts`, `stores/{connections,results}.ts`,
+`components/{ConnectionBar,QueryBar,ResultStatus}.vue`, a rewritten `App.vue`, the live
+section of the smoke harness, live mode in the bench harness, and `fixtures.wide`.
+`src/shared/ident.ts` moved out of `src/main/db/` — the renderer needs `quoteQualified`
+for the browse shortcut, and Phase 6's "copy qualified name" needs it too.
+
+**Seven findings:**
+
+1. **Three of the four bullets were already built, in the grid.** Read-ahead prefetch,
+   in-flight dedupe and stale-response abort all live in `DataWindowController`
+   (Phase 1), and "loading skeletons" are `paint.ts` drawing `theme.placeholder` for a
+   missing cell. Reimplementing them in `RemoteDataSource` would have put two
+   components in charge of deciding what to fetch. So `getBlock` is one honest request
+   per call and nothing more.
+2. **The gap the plan did not name was retry policy — and the grid structurally cannot
+   own it.** `DataWindowController.request()` re-asks for any block that is neither
+   cached nor in flight, and `update()` runs every frame. A range that fails
+   permanently is therefore re-requested **60 times a second forever**: against a server
+   that has gone away, a retry storm the user can neither see nor stop. Backoff
+   (250ms → 8s), an attempt limit, and terminal states live in `RemoteDataSource`
+   because the grid's API is frozen and the grid has no idea a failure was permanent.
+3. **The IPC event contract was broken and nothing could see it.** `TabbyEvents`
+   declared `onConnectionLost(listener: (connectionId: string) => void)`; main emitted
+   `{ connectionId }`. The emitter was typed `(channel: string, payload: unknown)`, so
+   neither the compiler nor any test could catch it — a listener would have compared an
+   object to a string and silently never matched. Both ends now derive from a single
+   `MainEventMap`, and the integration suite pins the payload shape at runtime.
+4. **`result:meta` was a registered channel with a router handler that was never on
+   `DatabaseApi` or in the preload.** The renderer literally could not ask for the exact
+   row count, so the `reltuples` estimate would have stayed on screen forever. Found by
+   the compiler the moment the results store needed it.
+5. **`invoke` only returns a `Result` when a handler exists.** A missing channel
+   _rejects_ — and an uncaught rejection in the renderer becomes a console error the user
+   cannot see, which took the bench harness down with it (both harnesses treat console
+   errors as failures). Every renderer → main call now goes through `invoke` /
+   `invokeDetached`, so "the server said no" and "there was nobody to ask" share one path.
+6. **Closing a connection raced its own cursors.** A live result holds a checked-out pool
+   client for its whole life, and `pool.end()` waits for every client to return — but
+   eviction released them fire-and-forget. In the app that meant `will-quit` always burned
+   its 2s grace period and exited by force whenever a result tab was open; in the bench
+   harness it hung **forever**. `QueryService.drain()` now awaits the releases, and
+   `services.dispose()`, `conn:close` and `conn:delete` all call it first.
+7. **Typed arrays survive Electron's IPC — verified, not assumed.** This was the
+   load-bearing risk of the whole columnar design: the unit tests round-trip through
+   Node's `structuredClone`, which is not the serializer Electron uses for `invoke`
+   results. The smoke harness now decodes a live block **by hand in the renderer** and
+   asserts `nulls` is still a `Uint8Array`, `offsets` a `Uint32Array`, `values` a
+   `Float64Array`, and that the bytes spell `1`, `5` and `row-1`.
+
+**Not done in Phase 5:** no human has clicked around a live result yet — the bench and
+smoke harnesses drive the DOM, which proves the wiring but not the feel. The connection
+editor is functional but plain (six fields, inline, no validation beyond what the IPC
+boundary enforces); Phase 6's explorer will supersede most of it. A query tab still shows
+the demo grid, because the editor is Phase 7. `RemoteDataSource` has no block cache of its
+own, so a scroll back over recently-seen rows re-fetches whatever the grid's LRU evicted.
+Coverage remains unmeasured.
+
+### Phase 6 — Schema explorer · 5 days · ◄── NEXT
 
 - Hand-built virtualised tree (reuse the grid's windowing concepts, not its code)
 - Table detail pane: columns, types, nullability, defaults, indexes, constraints, comments, generated DDL

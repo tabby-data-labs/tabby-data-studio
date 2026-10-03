@@ -134,6 +134,41 @@ export interface QueryProgressEvent {
   readonly rowsReceived: number;
 }
 
+export interface ConnectionLostEvent {
+  readonly connectionId: string;
+}
+
+/** Why a result disappeared, so the UI can say the right thing about it. */
+export type ResultEvictionReason = 'capacity' | 'expired';
+
+export interface ResultEvictedEvent {
+  readonly resultId: string;
+  readonly reason: ResultEvictionReason;
+}
+
+/**
+ * Every main → renderer payload, keyed by channel.
+ *
+ * This map exists because the two ends were previously typed independently: main
+ * emitted `{ connectionId }` while the preload declared the listener argument as a
+ * bare `string`, and nothing — not the compiler, not the tests — could see the
+ * mismatch, because the emitter was `(channel: string, payload: unknown)`. Both
+ * sides now derive from this one declaration.
+ */
+export interface MainEventMap {
+  [IpcChannel.evQueryProgress]: QueryProgressEvent;
+  [IpcChannel.evConnectionLost]: ConnectionLostEvent;
+  [IpcChannel.evResultEvicted]: ResultEvictedEvent;
+}
+
+export type MainEventChannel = keyof MainEventMap;
+
+/** The emitter main hands to its services. Payload type is checked per channel. */
+export type MainEventEmitter = <C extends MainEventChannel>(
+  channel: C,
+  payload: MainEventMap[C],
+) => void;
+
 // ── The bridge shape ─────────────────────────────────────────────────────────
 
 /**
@@ -160,6 +195,12 @@ export interface DatabaseApi {
 
   queryRun(req: QueryRunRequest): Promise<Result<QueryRunResponse>>;
   queryCancel(resultId: string): Promise<Result<void>>;
+  /**
+   * Current metadata for a result. How the renderer learns that the exact row
+   * count has replaced the `reltuples` estimate, since the count runs in the
+   * background after the first rows arrive.
+   */
+  resultMeta(resultId: string): Promise<Result<ResultMeta>>;
   /**
    * Columnar and packed (ARCHITECTURE §5.4): a block of a million rows arrives as
    * typed arrays, and the renderer decodes a cell only when it paints it.

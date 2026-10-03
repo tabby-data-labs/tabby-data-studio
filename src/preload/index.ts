@@ -56,6 +56,7 @@ const db: DatabaseApi = {
 
   queryRun: (req) => invoke(IpcChannel.queryRun, req),
   queryCancel: (resultId) => invoke(IpcChannel.queryCancel, resultId),
+  resultMeta: (resultId) => invoke(IpcChannel.resultMeta, resultId),
   resultWindow: (req) => invoke(IpcChannel.resultWindow, req),
   resultSort: (req) => invoke(IpcChannel.resultSort, req),
   resultDispose: (resultId) => invoke(IpcChannel.resultDispose, resultId),

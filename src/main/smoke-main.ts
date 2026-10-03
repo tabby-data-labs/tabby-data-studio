@@ -423,6 +423,86 @@ app
     };
   })()`)) as { deleteOk: boolean; deleteMissingCode: string };
 
+    /**
+     * Optional live section: the columnar wire format across a **real Electron
+     * IPC**, gated on TABBY_TEST_PG_*.
+     *
+     * The unit tests prove the codec round-trips through Node's `structuredClone`,
+     * which is not the same serializer Electron uses for `invoke` results. If
+     * Electron's structured clone flattened a `Float64Array` into a plain object,
+     * the whole columnar design would be worthless and no unit test would notice.
+     * This is the only place that can find out, so it decodes the bytes by hand in
+     * the renderer rather than trusting anything on the main side.
+     *
+     * The password is injected from this process's environment and is never
+     * written into an assertion, a log line, or the returned payload.
+     */
+    const pgUser = process.env['TABBY_TEST_PG_USER'] ?? '';
+    const pgDatabase = process.env['TABBY_TEST_PG_DATABASE'] ?? '';
+    const liveConfigured = pgUser !== '' && pgDatabase !== '';
+
+    const live = liveConfigured
+      ? ((await win.webContents.executeJavaScript(`(async () => {
+    const db = window.tabby.db;
+    const out = { ran: false, error: null };
+    const saved = await db.saveConnection({
+      connection: {
+        id: 'smoke-live',
+        name: 'smoke live',
+        host: ${JSON.stringify(process.env['TABBY_TEST_PG_HOST'] ?? 'localhost')},
+        port: ${JSON.stringify(Number(process.env['TABBY_TEST_PG_PORT'] ?? 5432))},
+        database: ${JSON.stringify(pgDatabase)},
+        user: ${JSON.stringify(pgUser)},
+        sslMode: 'disable',
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      password: ${JSON.stringify(process.env['TABBY_TEST_PG_PASSWORD'] ?? '')},
+    });
+    if (!saved.ok) { out.error = 'save:' + saved.error.code; return out; }
+
+    const opened = await db.openConnection('smoke-live');
+    if (!opened.ok) { out.error = 'open:' + opened.error.code; return out; }
+
+    const run = await db.queryRun({
+      connectionId: 'smoke-live',
+      sql: 'select * from fixtures.big order by id',
+      initialRows: 200,
+    });
+    if (!run.ok) { out.error = 'run:' + run.error.code; return out; }
+
+    const page = await db.resultWindow({ resultId: run.value.resultId, startRow: 0, rowCount: 5 });
+    if (!page.ok) { out.error = 'window:' + page.error.code; return out; }
+
+    const block = page.value;
+    const decoder = new TextDecoder();
+    const text = (col, row) =>
+      decoder.decode(col.bytes.subarray(col.offsets[row], col.offsets[row + 1]));
+    const kindOf = (value) => Object.prototype.toString.call(value);
+
+    out.ran = true;
+    out.startRow = block.startRow;
+    out.rowCount = block.rowCount;
+    out.encodings = block.columns.map((c) => c.encoding);
+    // The point of the exercise: are these still typed arrays after the bridge?
+    out.nullsKind = kindOf(block.columns[0].nulls);
+    out.offsetsKind = kindOf(block.columns[0].offsets);
+    out.bytesKind = kindOf(block.columns[0].bytes);
+    out.valuesKind = kindOf(block.columns[1].values);
+    out.firstId = text(block.columns[0], 0);
+    out.fifthId = text(block.columns[0], 4);
+    out.firstLabel = text(block.columns[2], 0);
+    out.bucketAt0 = block.columns[1].values[0];
+    out.metaColumns = run.value.meta.columns.map((c) => c.name);
+    out.metaRowCount = run.value.meta.rowCount;
+
+    await db.resultDispose(run.value.resultId);
+    await db.closeConnection('smoke-live');
+    await db.deleteConnection('smoke-live');
+    return out;
+  })()`)) as Record<string, unknown>)
+      : null;
+
     disposeIpc();
     // No session was ever opened (the harness has no database), but disposing is
     // what the real app does on quit and must not throw when there is nothing open.
@@ -578,6 +658,55 @@ app
         Object.values(hostile).every((v) => v === 'VALIDATION_FAILED'),
       ],
       ['prototype pollution did not reach Object.prototype', ipc.protoPolluted === false],
+
+      // ── Live-database section ────────────────────────────────────────────────
+      // Present only when TABBY_TEST_PG_* is set, so `npm run smoke` stays
+      // self-contained and the integration job is what exercises this.
+      ...(live === null
+        ? []
+        : ([
+            [
+              `live: a real query crossed the bridge${live['error'] ? ` (${String(live['error'])})` : ''}`,
+              live['ran'] === true,
+            ],
+            // The reason this section exists: Electron's serializer is not Node's
+            // structuredClone, and a flattened typed array would silently turn the
+            // columnar codec into a slow object graph.
+            [
+              'live: nulls bitmap is still a Uint8Array',
+              live['nullsKind'] === '[object Uint8Array]',
+            ],
+            [
+              'live: offsets are still a Uint32Array',
+              live['offsetsKind'] === '[object Uint32Array]',
+            ],
+            [
+              'live: the UTF-8 blob is still a Uint8Array',
+              live['bytesKind'] === '[object Uint8Array]',
+            ],
+            [
+              'live: numerics are still a Float64Array',
+              live['valuesKind'] === '[object Float64Array]',
+            ],
+            [
+              'live: each column kept its intended encoding',
+              JSON.stringify(live['encodings']) === '["utf8","float64","utf8","utf8"]',
+            ],
+            ['live: block shape survived', live['startRow'] === 0 && live['rowCount'] === 5],
+            // Decoded by hand in the renderer from the raw bytes, so this proves the
+            // payload is intact rather than that our own decoder agrees with itself.
+            ['live: int8 text is byte-exact (row 1)', live['firstId'] === '1'],
+            ['live: int8 text is byte-exact (row 5)', live['fifthId'] === '5'],
+            ['live: text column is byte-exact', live['firstLabel'] === 'row-1'],
+            ['live: int4 decoded to the right number', live['bucketAt0'] === 1],
+            [
+              'live: column metadata crossed the bridge',
+              JSON.stringify(live['metaColumns']) === '["id","bucket","label","payload"]',
+            ],
+            // A cursor result reports -1 until it reaches the end: main must not
+            // re-run the user's query just to count it.
+            ['live: row count is unknown, not guessed', live['metaRowCount'] === -1],
+          ] as [string, boolean][])),
 
       ['no unexpected console errors', problems.length === 0],
     ];
