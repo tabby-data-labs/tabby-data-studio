@@ -1,22 +1,31 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
+import { quoteQualified } from '@shared/ident';
 import ConnectionBar from '@/components/ConnectionBar.vue';
 import DataGridVue from '@/components/DataGridVue.vue';
 import QueryBar from '@/components/QueryBar.vue';
 import ResultStatus from '@/components/ResultStatus.vue';
+import SchemaTree from '@/components/SchemaTree.vue';
 import TabBar from '@/components/TabBar.vue';
+import TableDetail from '@/components/TableDetail.vue';
 import { runScrollBench, type BenchResult } from '@/grid/bench';
 import type { DataGrid } from '@/grid/create-data-grid';
 import type { ClipboardFormat } from '@/grid/clipboard';
 import { FakeDataSource } from '@/grid/fake-source';
 import { boundingBox, selectedCellCount } from '@/grid/selection';
 import type { DataSource, SelectionState, SortSpec } from '@/grid/types';
+import type { TreeRow } from '@/schema/tree-model';
 import { useConnectionsStore } from '@/stores/connections';
 import { useResultsStore, type RunInput } from '@/stores/results';
+import { useSchemaStore } from '@/stores/schema';
 import { useTabsStore } from '@/stores/tabs';
 
 const SYNTHETIC_ROWS = 1_000_000;
 const SYNTHETIC_COLUMNS = 30;
+/** Rows fetched before the first window request; matches main's default. */
+const INITIAL_ROWS = 200;
+/** What the tree's "Select top 1000" asks for. The SSMS idiom, kept verbatim. */
+const TOP_ROWS = 1_000;
 /**
  * The demo tab's sentinel result id. Main has never heard of it. It exists so the
  * synthetic 1M-row grid — and therefore the benchmark the perf gate drives —
@@ -32,6 +41,7 @@ const synthetic = new FakeDataSource({
 
 const connections = useConnectionsStore();
 const results = useResultsStore();
+const schema = useSchemaStore();
 const tabs = useTabsStore();
 
 const grid = shallowRef<DataGrid | null>(null);
@@ -98,11 +108,13 @@ onMounted(async () => {
   // One subscription for the whole app rather than one per result: a listener
   // attached per tab leaks the moment tabs start closing.
   results.subscribe();
+  schema.subscribe();
   await connections.load();
 });
 
 onBeforeUnmount(() => {
   results.unsubscribe();
+  schema.unsubscribe();
 });
 
 /**
@@ -137,6 +149,118 @@ function onCloseResult(resultId: string): void {
   const tab = tabs.byResultId(resultId);
   if (tab) tabs.close(tab.id);
 }
+
+// ── Schema explorer (Phase 6) ────────────────────────────────────────────────
+
+/**
+ * The tree follows the open connection.
+ *
+ * `opened` is joined into the watch source because `isOpen` is a method: watching
+ * it directly would not register a dependency, and the tree would keep showing a
+ * closed connection's catalog. Closing detaches rather than merely clearing, so a
+ * stale tree can never be browsed into a `NOT_CONNECTED` error.
+ */
+watch(
+  () => [connections.activeId, connections.opened.join(',')] as const,
+  ([activeId]) => {
+    if (activeId !== null && connections.isOpen(activeId)) {
+      const summary = connections.list.find((candidate) => candidate.id === activeId);
+      const label =
+        summary === undefined
+          ? activeId
+          : `${summary.name} · ${summary.host}:${summary.port}/${summary.database}`;
+      schema.attach(activeId, label);
+      return;
+    }
+    schema.detach();
+  },
+  { immediate: true },
+);
+
+const RELATION_KINDS = new Set(['table', 'view', 'materializedView']);
+
+/** Builds the statement a tree row stands for, or null if the name cannot be quoted. */
+function statementFor(row: TreeRow, suffix: string): string | null {
+  if (!RELATION_KINDS.has(row.kind) || row.schema === '') return null;
+  try {
+    return `select * from ${quoteQualified(row.schema, row.label)}${suffix}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Double-click / Enter / "Browse all rows": the paged browse path.
+ *
+ * `browse` is what keeps it cheap — main resolves a pagination key from the
+ * catalog and pages with a keyset seek, holding **no transaction open**. Without
+ * it the same rows would pin a cursor, and therefore an xmin horizon, for as long
+ * as the tab stays open.
+ */
+async function onBrowseRelation(row: TreeRow): Promise<void> {
+  const statement = statementFor(row, '');
+  if (statement === null) {
+    notice.value = 'That node cannot be browsed';
+    return;
+  }
+  await onRun({
+    connectionId: row.connectionId,
+    sql: statement,
+    title: `${row.schema}.${row.label}`,
+    browse: { schema: row.schema, table: row.label },
+    initialRows: INITIAL_ROWS,
+  });
+}
+
+/**
+ * "Select top 1000": a real `limit`, run as an ordinary statement.
+ *
+ * Two things are honest about this one. The rows are whatever the server returns
+ * first — no `order by`, so a repeat can differ, exactly as SSMS's "Edit Top 200
+ * Rows" does. And unlike the browse path it takes a cursor, which holds a
+ * transaction; `idle_in_transaction_session_timeout` (60s by default) will close
+ * it if the tab is left alone, and the status line then offers a Retry. That is
+ * the pre-existing behaviour of every query-console result, not something the tree
+ * introduces.
+ */
+async function onTopRows(row: TreeRow): Promise<void> {
+  const statement = statementFor(row, ` limit ${TOP_ROWS}`);
+  if (statement === null) {
+    notice.value = 'That node cannot be queried';
+    return;
+  }
+  await onRun({
+    connectionId: row.connectionId,
+    sql: statement,
+    title: `${row.schema}.${row.label} · top ${TOP_ROWS}`,
+    initialRows: TOP_ROWS,
+  });
+}
+
+async function onCopyDdl(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    notice.value = 'Copied the generated DDL';
+  } catch {
+    // A packaged renderer is a non-secure file:// origin, where the async clipboard
+    // API can be unavailable. Say so; the text is on screen and selectable either way.
+    notice.value = 'Clipboard refused — select the DDL text to copy it';
+  }
+}
+
+/**
+ * The detail pane is always mounted, and shows its own invitation when nothing is
+ * selected.
+ *
+ * Mounting it conditionally was the obvious first version and is worse for two
+ * reasons: a pane that appears and disappears resizes the grid under the user, and
+ * "Copy DDL" would have no permanent home. Its empty state is a feature — it is how
+ * the user learns the pane exists.
+ */
+const detailErrorText = computed(() => {
+  const error = schema.detailError;
+  return error === null ? null : `${error.code}: ${error.message}`;
+});
 
 const selectionSummary = computed(() => {
   const current = selection.value;
@@ -283,7 +407,7 @@ function onGoToRow(): void {
     <header class="flex items-baseline gap-3 border-b border-line bg-panel px-4 py-2">
       <h1 class="text-sm font-semibold tracking-wide text-fg">Tabby</h1>
       <span class="text-xs text-muted">
-        Phase 5 — {{ liveResultId === null ? 'synthetic grid' : 'live result' }}
+        Phase 6 — {{ liveResultId === null ? 'synthetic grid' : 'live result' }}
       </span>
       <span class="ml-auto text-[11px] text-muted">
         {{ headerSummary }}
@@ -359,23 +483,42 @@ function onGoToRow(): void {
       <span class="text-muted">{{ bench.measureTextCalls.toLocaleString() }} measureText</span>
     </div>
 
-    <main class="min-h-0 flex-1">
-      <DataGridVue
-        v-if="activeSource !== null"
-        :key="gridKey"
-        :source="activeSource"
-        :frozen-column-count="frozen"
-        :label="gridLabel"
-        @ready="onReady"
-        @selection="selection = $event"
+    <div class="flex min-h-0 flex-1">
+      <SchemaTree
+        class="w-72 shrink-0"
+        data-sidebar-tree
+        @open="onBrowseRelation"
+        @open-top="onTopRows"
+        @notice="notice = $event"
       />
-      <div
-        v-else
-        class="flex h-full items-center justify-center px-6 text-center text-xs text-muted"
-      >
-        This result is no longer available. Close the tab and re-run the query.
-      </div>
-    </main>
+
+      <main class="min-h-0 min-w-0 flex-1">
+        <DataGridVue
+          v-if="activeSource !== null"
+          :key="gridKey"
+          :source="activeSource"
+          :frozen-column-count="frozen"
+          :label="gridLabel"
+          @ready="onReady"
+          @selection="selection = $event"
+        />
+        <div
+          v-else
+          class="flex h-full items-center justify-center px-6 text-center text-xs text-muted"
+        >
+          This result is no longer available. Close the tab and re-run the query.
+        </div>
+      </main>
+
+      <TableDetail
+        class="w-[22rem] shrink-0 border-l border-line"
+        data-sidebar-detail
+        :detail="schema.detail"
+        :loading="schema.detailLoading"
+        :error="detailErrorText"
+        @copy-ddl="onCopyDdl"
+      />
+    </div>
 
     <footer
       class="flex items-center gap-4 border-t border-line bg-panel px-4 py-1.5 text-[11px] text-muted"

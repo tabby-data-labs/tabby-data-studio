@@ -314,6 +314,30 @@ app
 
     if (interaction.error) problems.push(`interaction: ${interaction.error}`);
 
+    // ── Schema explorer (Phase 6) ────────────────────────────────────────────
+    // Database-free on purpose: what this proves is that the new sidebar mounts
+    // under the **production CSP** and renders its empty states rather than
+    // throwing into a render. A component that only works with a database attached
+    // would take the whole window down for every user until they connected.
+    const tree = (await win.webContents.executeJavaScript(`(() => {
+    const pane = document.querySelector('[data-schema-tree]');
+    const detail = document.querySelector('[data-table-detail]');
+    return {
+      panePresent: !!pane,
+      treeRoles: document.querySelectorAll('[role="tree"]').length,
+      treeitems: document.querySelectorAll('[role="treeitem"]').length,
+      emptyState: pane ? (pane.textContent || '').includes('Open a connection') : false,
+      filterPresent: !!document.querySelector('[data-tree-filter]'),
+      refreshPresent: !!document.querySelector('[data-tree-refresh]'),
+      detailPresent: !!detail,
+      detailInvites: detail
+        ? (detail.textContent || '').includes('Select a table, view or materialized view')
+        : false,
+      // No connection is open, so nothing may have been fetched or rendered.
+      scrollerPresent: !!document.querySelector('[data-tree-scroller]'),
+    };
+  })()`)) as Record<string, unknown>;
+
     // ── IPC round-trip ─────────────────────────────────────────────────────────
     // Exercises the production path end to end: renderer -> contextBridge ->
     // ipcMain -> validator -> SettingsStore -> Result back. Also proves a hostile
@@ -464,6 +488,66 @@ app
     const opened = await db.openConnection('smoke-live');
     if (!opened.ok) { out.error = 'open:' + opened.error.code; return out; }
 
+    // ── Phase 6: the catalog payload across a real Electron IPC ──────────────
+    // Run before the query section and never allowed to abort it, so a catalog
+    // regression reports itself instead of hiding behind an unrelated failure.
+    try {
+      const schemas = await db.schemaChildren({
+        connectionId: 'smoke-live',
+        parentSchema: null,
+      });
+      out.schemasOk = schemas.ok === true;
+      out.schemaNames = schemas.ok ? schemas.value.map((n) => n.name) : [];
+
+      const many = await db.schemaChildren({
+        connectionId: 'smoke-live',
+        parentSchema: 'fixtures_many',
+      });
+      out.manyCount = many.ok ? many.value.length : -1;
+      out.manyFirstKind = many.ok && many.value[0] ? many.value[0].kind : null;
+      out.manyHasChildren = many.ok && many.value[0] ? many.value[0].hasChildren : null;
+
+      const detail = await db.schemaTable({
+        connectionId: 'smoke-live',
+        schema: 'fixtures',
+        table: 'detail_sample',
+      });
+      out.detailOk = detail.ok === true;
+      out.detailError = detail.ok ? null : detail.error.code;
+      if (detail.ok) {
+        const d = detail.value;
+        out.detailKind = d.kind;
+        out.detailColumnTypes = d.meta.columns.map((c) => c.formattedType);
+        out.detailComment = d.meta.comment;
+        out.detailIndexCount = d.indexes.length;
+        out.detailHasPartialIndex = d.indexes.some(
+          (i) => i.name === 'detail_sample_partial_uq',
+        );
+        out.detailHasExpressionIndex = d.indexes.some(
+          (i) => i.definition.includes('lower((code)::text)'),
+        );
+        out.detailConstraintCount = d.constraints.length;
+        out.detailHasNotNullConstraint = d.constraints.some((c) =>
+          c.definition.startsWith('NOT NULL'),
+        );
+        out.detailDdlIsArray = Array.isArray(d.ddl);
+        out.detailDdlCount = d.ddl.length;
+        out.detailDdlStartsCreate =
+          typeof d.ddl[0] === 'string' &&
+          d.ddl[0].startsWith('create table "fixtures"."detail_sample" (');
+        out.detailDdlEscapesNewline = d.ddl.some(
+          (s) => typeof s === 'string' && s.includes('\\\\n'),
+        );
+      }
+
+      const refreshed = await db.refreshSchema('smoke-live');
+      out.refreshOk = refreshed.ok === true;
+      out.refreshDropped = refreshed.ok ? refreshed.value : -1;
+      out.catalogDone = true;
+    } catch (e) {
+      out.catalogError = String(e);
+    }
+
     const run = await db.queryRun({
       connectionId: 'smoke-live',
       sql: 'select * from fixtures.big order by id',
@@ -608,6 +692,21 @@ app
       ['selected cells are exposed to assistive tech', Number(ariaInfo?.selectedCells ?? 0) > 0],
       ['live region announced the active cell', String(ariaInfo?.liveText ?? '').length > 0],
 
+      // ── Schema explorer mounts under the production CSP ─────────────────────
+      ['schema tree pane is present', tree['panePresent'] === true],
+      ['the tree declares itself a tree', tree['treeRoles'] === 0 || tree['treeRoles'] === 1],
+      [
+        'with no connection open it shows the empty state, not a scroller',
+        tree['emptyState'] === true && tree['scrollerPresent'] === false,
+      ],
+      ['no tree rows exist before a connection is open', tree['treeitems'] === 0],
+      ['the filter box is present', tree['filterPresent'] === true],
+      ['the refresh control is present', tree['refreshPresent'] === true],
+      [
+        'the detail pane is mounted and invites a selection',
+        tree['detailPresent'] === true && tree['detailInvites'] === true,
+      ],
+
       // ── IPC contract ───────────────────────────────────────────────────────
       ['bridge exposes the db API', ipc.hasDb === true],
       ['bridge exposes event subscriptions', ipc.hasEvents === true],
@@ -706,6 +805,64 @@ app
             // A cursor result reports -1 until it reaches the end: main must not
             // re-run the user's query just to count it.
             ['live: row count is unknown, not guessed', live['metaRowCount'] === -1],
+
+            // ── Phase 6: the catalog payload ─────────────────────────────────
+            [
+              `live: the schema tree crossed the bridge${live['catalogError'] ? ` (${String(live['catalogError'])})` : ''}`,
+              live['catalogDone'] === true && live['schemasOk'] === true,
+            ],
+            [
+              'live: the 2,000-table fixture schema is listed',
+              Array.isArray(live['schemaNames']) &&
+                (live['schemaNames'] as string[]).includes('fixtures_many'),
+            ],
+            ['live: all 2,000 relations crossed in one payload', live['manyCount'] === 2_000],
+            [
+              'live: relation nodes arrive typed and childless',
+              live['manyFirstKind'] === 'table' && live['manyHasChildren'] === false,
+            ],
+            [
+              `live: the table detail crossed the bridge${live['detailError'] ? ` (${String(live['detailError'])})` : ''}`,
+              live['detailOk'] === true && live['detailKind'] === 'table',
+            ],
+            // The reason `format_type` is read at all: without the modifiers the
+            // pane would say `varchar` and the generated DDL would not recreate it.
+            [
+              'live: type modifiers survived the bridge',
+              JSON.stringify(live['detailColumnTypes']) ===
+                '["bigint","integer","character varying(64)","character varying(255)",' +
+                  '"numeric(12,4)","timestamp with time zone","text"]',
+            ],
+            [
+              'live: the table comment survived',
+              live['detailComment'] === 'the detail-pane comparison fixture',
+            ],
+            [
+              'live: expression and partial indexes are both listed',
+              live['detailIndexCount'] === 5 &&
+                live['detailHasPartialIndex'] === true &&
+                live['detailHasExpressionIndex'] === true,
+            ],
+            // PostgreSQL 18 stores NOT NULL in pg_constraint. Dropping those rows
+            // is what keeps the pane from listing every NOT NULL column twice.
+            [
+              'live: PostgreSQL 18 NOT NULL rows are dropped',
+              live['detailConstraintCount'] === 4 && live['detailHasNotNullConstraint'] === false,
+            ],
+            [
+              'live: generated DDL arrived as separate statements',
+              live['detailDdlIsArray'] === true &&
+                live['detailDdlCount'] === 5 &&
+                live['detailDdlStartsCreate'] === true,
+            ],
+            [
+              'live: a multi-line comment was escaped, not split',
+              live['detailDdlEscapesNewline'] === true,
+            ],
+            [
+              'live: refresh invalidated the catalog cache',
+              live['refreshOk'] === true && Number(live['refreshDropped']) > 0,
+            ],
           ] as [string, boolean][])),
 
       ['no unexpected console errors', problems.length === 0],
@@ -720,6 +877,7 @@ app
           profile,
           report,
           interaction,
+          tree,
           clipboard: {
             payloadLines: payloadLines.length,
             payloadFields,

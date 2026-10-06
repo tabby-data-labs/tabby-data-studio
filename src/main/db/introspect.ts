@@ -11,7 +11,15 @@
  * the renderer is ever concatenated into these strings, so `quoteIdent` is not
  * needed here — and cannot be forgotten here.
  */
-import type { SchemaNode, SchemaNodeKind, TableMeta, UniqueIndexMeta } from '../../shared/domain';
+import type {
+  ConstraintKind,
+  ConstraintMeta,
+  IndexMeta,
+  SchemaNode,
+  SchemaNodeKind,
+  TableMeta,
+  UniqueIndexMeta,
+} from '../../shared/domain';
 
 /** Schemas a user never wants to browse. Excluded in SQL so the server does the work. */
 export const SYSTEM_SCHEMAS: readonly string[] = ['pg_catalog', 'information_schema', 'pg_toast'];
@@ -54,6 +62,7 @@ select att.attnum,
        att.attisdropped,
        att.attnotnull,
        typ.typname,
+       pg_catalog.format_type(att.atttypid, att.atttypmod) as typfmt,
        typ.oid as typeoid,
        pg_catalog.pg_get_expr(def.adbin, def.adrelid) as adsrc,
        dsc.description as comment
@@ -117,6 +126,50 @@ export const SERVER_VERSION_SQL = 'select version()';
 /** `SHOW`, not `SELECT current_setting(…)`: it reports what this session sees. */
 export const READ_ONLY_PROBE_SQL = 'show default_transaction_read_only';
 
+/**
+ * $1 = schema name, $2 = relation name. Every index, for the Phase 6 detail pane.
+ *
+ * Deliberately **not** folded into `INDEXES_SQL`. That query aggregates `indkey`
+ * into a column list, which is why it must exclude expression indexes (their
+ * `indkey` entries are zero) and partial indexes ("unique among rows matching a
+ * predicate" cannot identify a row). Those exclusions are a correctness property
+ * of row identity and must stay.
+ *
+ * The detail pane has the opposite requirement: hiding a partial unique index
+ * would hide the reason a duplicate insert was rejected. So it reads the server's
+ * own `pg_get_indexdef` text, which renders expressions and predicates correctly
+ * and is already quoted — nothing here is reconstructed from attnums.
+ */
+export const INDEX_DEFS_SQL = `
+select cls.relname as indexname,
+       idx.indisprimary,
+       idx.indisunique,
+       pg_catalog.pg_get_indexdef(idx.indexrelid) as definition
+from pg_catalog.pg_index idx
+join pg_catalog.pg_class cls on cls.oid = idx.indexrelid
+join pg_catalog.pg_class tbl on tbl.oid = idx.indrelid
+join pg_catalog.pg_namespace nsp on nsp.oid = tbl.relnamespace
+where nsp.nspname = $1
+  and tbl.relname = $2
+order by idx.indisprimary desc, cls.relname
+`.trim();
+
+/**
+ * $1 = schema name, $2 = relation name. The body of a view or materialized view.
+ *
+ * The `relkind` filter is what makes this safe to run for a table: it returns zero
+ * rows instead of raising `cannot get view definition of non-view`. `true` is the
+ * pretty-print flag, so the body arrives laid out rather than on one long line.
+ */
+export const RELATION_DEF_SQL = `
+select pg_catalog.pg_get_viewdef(cls.oid, true) as definition
+from pg_catalog.pg_class cls
+join pg_catalog.pg_namespace nsp on nsp.oid = cls.relnamespace
+where nsp.nspname = $1
+  and cls.relname = $2
+  and cls.relkind in ('v', 'm')
+`.trim();
+
 // ── Row shapes ───────────────────────────────────────────────────────────────
 
 export interface SchemaFolderRow {
@@ -140,6 +193,7 @@ export interface ColumnRow {
   readonly attisdropped: boolean;
   readonly attnotnull: boolean;
   readonly typname: string;
+  readonly typfmt: string | null;
   readonly typeoid: number;
   readonly adsrc: string | null;
   readonly comment: string | null;
@@ -152,6 +206,23 @@ export interface IndexRow {
   /** In index order, as aggregated by `array_agg(… order by …)`. */
   readonly columns: readonly string[];
   readonly allnotnull: boolean;
+}
+
+export interface IndexDefRow {
+  readonly indexname: string;
+  readonly indisprimary: boolean;
+  readonly indisunique: boolean;
+  readonly definition: string;
+}
+
+export interface ConstraintRow {
+  readonly conname: string;
+  readonly contype: string;
+  readonly definition: string;
+}
+
+export interface RelationDefRow {
+  readonly definition: string;
 }
 
 export interface TableMetaInput {
@@ -182,6 +253,69 @@ const RELKINDS = new Map<string, SchemaNodeKind>([
 export function relationKindFor(relkind: unknown): SchemaNodeKind | null {
   if (typeof relkind !== 'string') return null;
   return RELKINDS.get(relkind) ?? null;
+}
+
+/**
+ * `pg_constraint.contype`, mapped for the detail pane (PLAN Phase 6).
+ *
+ * Same shape as `RELKINDS`: a `Map`, not an object literal, so `'constructor'` and
+ * friends cannot resolve through the prototype. Case-sensitive because the catalog
+ * stores single lowercase characters and `'P'` means nothing.
+ *
+ * `'t'` (constraint trigger) is deliberately unmapped: it has no column list and
+ * no text a user compares against `\d+`, so rendering it as an unknown category
+ * would add noise rather than information.
+ */
+const CONSTRAINT_KINDS = new Map<string, ConstraintKind>([
+  ['p', 'primary'],
+  ['u', 'unique'],
+  ['f', 'foreign'],
+  ['c', 'check'],
+  ['x', 'exclusion'],
+]);
+
+export function constraintKindFor(contype: unknown): ConstraintKind | null {
+  if (typeof contype !== 'string') return null;
+  return CONSTRAINT_KINDS.get(contype) ?? null;
+}
+
+/**
+ * One constraint row, or null when it is not something the detail pane renders.
+ *
+ * `definition` is `pg_get_constraintdef` output, kept verbatim. Rebuilding it from
+ * `conkey`/`confkey` would mean re-deriving column order, match type, operator
+ * classes and the `ON DELETE`/`ON UPDATE` actions — all of which the server
+ * already renders correctly, in a form guaranteed to re-parse.
+ *
+ * It is *not* byte-identical to what `\d+` shows: psql reformats the function's
+ * text (it prints `CHECK (amount >= 0::numeric)` where the catalog returns
+ * `CHECK ((amount >= (0)::numeric))`). Tabby shows the catalog's version.
+ */
+export function toConstraint(row: ConstraintRow): ConstraintMeta | null {
+  if (row === null || typeof row !== 'object') return null;
+  const kind = constraintKindFor(row.contype);
+  if (kind === null) return null;
+  if (typeof row.definition !== 'string' || row.definition === '') return null;
+  if (typeof row.conname !== 'string' || row.conname === '') return null;
+  return { name: row.conname, kind, definition: row.definition };
+}
+
+/**
+ * One index row for the detail pane, or null when there is no definition text.
+ *
+ * A missing flag reads as **false**: claiming `isUnique` for an index we could not
+ * prove unique would be exactly the error `INDEXES_SQL`'s filters exist to avoid.
+ */
+export function toIndexMeta(row: IndexDefRow): IndexMeta | null {
+  if (row === null || typeof row !== 'object') return null;
+  if (typeof row.definition !== 'string' || row.definition === '') return null;
+  if (typeof row.indexname !== 'string' || row.indexname === '') return null;
+  return {
+    name: row.indexname,
+    isPrimary: row.indisprimary === true,
+    isUnique: row.indisunique === true,
+    definition: row.definition,
+  };
 }
 
 /**
@@ -270,6 +404,11 @@ export function toTableMeta(input: TableMetaInput): TableMeta {
     .map((column, index) => ({
       name: column.attname,
       typeName: column.typname,
+      // `format_type` is what makes the DDL reproducible — `varchar` alone loses
+      // the `(255)`. Falling back to `typname` rather than emitting an empty type
+      // keeps the column usable if the server ever returns nothing here.
+      formattedType:
+        typeof column.typfmt === 'string' && column.typfmt !== '' ? column.typfmt : column.typname,
       typeOid: column.typeoid,
       // A missing flag reads as nullable: claiming NOT NULL when unsure would let
       // a future editor skip a null check.

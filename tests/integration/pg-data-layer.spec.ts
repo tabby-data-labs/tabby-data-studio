@@ -842,3 +842,279 @@ describe.skipIf(!pgConfigured)('live postgres · registry memory cap soak', () =
     expect(await idleInTransactionBackends(h)).toBe(0);
   }, 30_000);
 });
+
+/**
+ * Phase 6 exit criteria: the object tree matches `psql`'s `\d+` for a sample
+ * table, and a schema with 2,000 relations reads in one go.
+ *
+ * Every expected string below was copied out of a real PostgreSQL 18.6 server
+ * rather than derived from the queries that produce it — column types,
+ * nullability, defaults and descriptions from `\d+ fixtures.detail_sample`, and
+ * index and constraint definitions from `pg_get_indexdef` / `pg_get_constraintdef`
+ * directly, because psql **reformats** those two and the pane shows the catalog
+ * functions' text. Deriving expectations from our own SQL is how a mapper that
+ * agrees with itself and disagrees with the server gets shipped.
+ */
+describe.skipIf(!pgConfigured)('live postgres · schema explorer', () => {
+  let h: Harness;
+  const DETAIL_TABLE = 'detail_sample';
+  const MANY_SCHEMA = 'fixtures_many';
+
+  beforeAll(async () => {
+    h = createHarness();
+    await h.connections.open(CONNECTION_ID);
+  }, 30_000);
+
+  afterAll(async () => {
+    await h?.dispose();
+  });
+
+  it('reads a table exactly as \\d+ reports it', async () => {
+    const result = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, DETAIL_TABLE);
+    expect(result.ok, result.ok ? '' : result.error.message).toBe(true);
+    if (!result.ok) return;
+    const detail = result.value;
+
+    expect(detail.kind).toBe('table');
+    expect(detail.meta.name).toBe(DETAIL_TABLE);
+    expect(detail.meta.comment).toBe('the detail-pane comparison fixture');
+
+    // The Type column of `\d+`, verbatim. `pg_type.typname` would have said
+    // `varchar` and `numeric`, losing the modifiers that define the column.
+    expect(detail.meta.columns.map((column) => [column.name, column.formattedType])).toEqual([
+      ['id', 'bigint'],
+      ['tenant_id', 'integer'],
+      ['code', 'character varying(64)'],
+      ['label', 'character varying(255)'],
+      ['amount', 'numeric(12,4)'],
+      ['created_at', 'timestamp with time zone'],
+      ['note', 'text'],
+    ]);
+
+    // The Nullable column of `\d+`.
+    expect(detail.meta.columns.map((column) => column.nullable)).toEqual([
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+    ]);
+
+    // The Default column of `\d+`, which is `pg_get_expr(adbin, adrelid)`.
+    expect(detail.meta.columns.map((column) => column.defaultExpression)).toEqual([
+      null,
+      '1',
+      null,
+      null,
+      '0',
+      'now()',
+      null,
+    ]);
+
+    // The Description column, including one that spans two lines.
+    const byName = new Map(detail.meta.columns.map((column) => [column.name, column]));
+    expect(byName.get('id')?.comment).toBe('surrogate key');
+    expect(byName.get('amount')?.comment).toBe('non-negative, enforced by a check');
+    expect(byName.get('note')?.comment).toBe(
+      'nullable on purpose\nso the partial index has rows to exclude',
+    );
+    expect(byName.get('label')?.comment).toBeNull();
+  }, 30_000);
+
+  it('lists every index \\d+ lists, including the expression and partial ones', async () => {
+    const result = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, DETAIL_TABLE);
+    if (!result.ok) return;
+
+    const names = result.value.indexes.map((index) => index.name);
+    expect(names).toEqual([
+      'detail_sample_pkey',
+      'detail_sample_code_uq',
+      'detail_sample_label_idx',
+      'detail_sample_lower_code_idx',
+      'detail_sample_partial_uq',
+    ]);
+
+    const byName = new Map(result.value.indexes.map((index) => [index.name, index]));
+    expect(byName.get('detail_sample_pkey')).toMatchObject({ isPrimary: true, isUnique: true });
+    expect(byName.get('detail_sample_label_idx')).toMatchObject({
+      isPrimary: false,
+      isUnique: false,
+    });
+    // `pg_get_indexdef` renders the expression the way the server stores it. This
+    // is **not** what `\d+` prints: psql drops the `CREATE … USING` prefix and
+    // shows `lower(code::text)`, while the catalog function returns the fully
+    // parenthesised `lower((code)::text)`. Same meaning, different text. Pinned to
+    // the function, because that is what Tabby displays.
+    expect(byName.get('detail_sample_lower_code_idx')?.definition).toBe(
+      'CREATE INDEX detail_sample_lower_code_idx ON fixtures.detail_sample USING btree (lower((code)::text))',
+    );
+    expect(byName.get('detail_sample_partial_uq')?.definition).toBe(
+      'CREATE UNIQUE INDEX detail_sample_partial_uq ON fixtures.detail_sample USING btree (tenant_id) WHERE (note IS NOT NULL)',
+    );
+  }, 30_000);
+
+  it('gives row identity and the detail pane different answers about the partial index', async () => {
+    // One object, two correct answers. `uniqueIndexes` feeds paging and the v2 row
+    // identity, where a partial unique index is unusable — it is only unique among
+    // rows matching the predicate. `indexes` feeds the pane, where hiding it would
+    // hide the reason a duplicate insert was rejected.
+    const detail = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, DETAIL_TABLE);
+    if (!detail.ok) return;
+    const uniqueNames = detail.value.meta.uniqueIndexes.map((index) => index.name);
+    expect(uniqueNames).toContain('detail_sample_pkey');
+    expect(uniqueNames).toContain('detail_sample_code_uq');
+    expect(uniqueNames).not.toContain('detail_sample_partial_uq');
+    expect(uniqueNames).not.toContain('detail_sample_lower_code_idx');
+
+    expect(detail.value.indexes.map((index) => index.name)).toContain('detail_sample_partial_uq');
+    expect(await h.schemas.paginationKeyFor(CONNECTION_ID, SCHEMA, DETAIL_TABLE)).toEqual(['id']);
+  }, 30_000);
+
+  it('lists constraints by kind, and drops the NOT NULL rows PostgreSQL 18 adds', async () => {
+    const result = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, DETAIL_TABLE);
+    if (!result.ok) return;
+
+    const byName = new Map(result.value.constraints.map((c) => [c.name, c]));
+    expect(byName.get('detail_sample_pkey')?.kind).toBe('primary');
+    expect(byName.get('detail_sample_code_uq')?.kind).toBe('unique');
+    expect(byName.get('detail_sample_amount_chk')?.kind).toBe('check');
+    expect(byName.get('detail_sample_tenant_fk')?.kind).toBe('foreign');
+
+    // `\d+` prints a whole "Not-null constraints" section on 18. Tabby does not:
+    // the Nullable column already says it, and listing both would show every
+    // NOT NULL column twice.
+    expect(result.value.constraints).toHaveLength(4);
+    expect(result.value.constraints.every((c) => !c.definition.startsWith('NOT NULL'))).toBe(true);
+
+    // Definitions are `pg_get_constraintdef` output, verbatim — not a
+    // reconstruction that happens to look similar. It is also not byte-identical to
+    // `\d+`: psql prints `CHECK (amount >= 0::numeric)` where the catalog function
+    // returns the fully parenthesised form below. Tabby shows the function's text,
+    // because that is the version guaranteed to re-parse.
+    expect(byName.get('detail_sample_amount_chk')?.definition).toBe(
+      'CHECK ((amount >= (0)::numeric))',
+    );
+    expect(byName.get('detail_sample_tenant_fk')?.definition).toBe(
+      'FOREIGN KEY (tenant_id) REFERENCES fixtures.plain_table(id)',
+    );
+    expect(byName.get('detail_sample_pkey')?.definition).toBe('PRIMARY KEY (id)');
+    expect(byName.get('detail_sample_code_uq')?.definition).toBe('UNIQUE (code)');
+  }, 30_000);
+
+  it('generates DDL that quotes every name and keeps type modifiers', async () => {
+    const result = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, DETAIL_TABLE);
+    if (!result.ok) return;
+    const ddl = result.value.ddl;
+
+    expect(ddl.length).toBeGreaterThan(0);
+    const create = ddl[0] ?? '';
+    expect(create.startsWith('create table "fixtures"."detail_sample" (')).toBe(true);
+    expect(create).toContain('"label" character varying(255)');
+    expect(create).toContain('"amount" numeric(12,4) default 0');
+    expect(create).toContain('"created_at" timestamp with time zone not null default now()');
+    expect(create).toContain('constraint "detail_sample_pkey" PRIMARY KEY (id)');
+    expect(create.endsWith(');')).toBe(true);
+
+    // One terminating semicolon per statement. The multi-line comment must come
+    // out in the E'' form, or the newline would end the literal early and the rest
+    // of the text would be parsed as SQL.
+    const statements = ddl.filter((statement) => statement.includes('comment on'));
+    expect(statements).toHaveLength(4);
+    for (const statement of statements) {
+      expect(statement.endsWith(';'), statement).toBe(true);
+      expect(statement.slice(0, -1).endsWith(';'), statement).toBe(false);
+    }
+
+    const noteComment = statements.find((statement) => statement.includes('"note"')) ?? '';
+    expect(noteComment).toContain(`is E'nullable on purpose\\nso the partial index`);
+    // The single-line ones stay in the plain form: no reason to make a user read
+    // escape syntax where none is needed.
+    const idComment = statements.find((statement) => statement.includes('"id"')) ?? '';
+    expect(idComment).toBe(`comment on column "fixtures"."detail_sample"."id" is 'surrogate key';`);
+    expect(ddl).toContain(
+      `comment on table "fixtures"."detail_sample" is 'the detail-pane comparison fixture';`,
+    );
+  }, 30_000);
+
+  it('generates DDL for a table whose name needs quoting', async () => {
+    const result = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, 'with"dquote');
+    expect(result.ok, result.ok ? '' : result.error.message).toBe(true);
+    if (!result.ok) return;
+    // Doubling the embedded quote is what makes the statement safe to paste back.
+    expect(result.value.ddl[0]).toContain('create table "fixtures"."with""dquote"');
+  }, 30_000);
+
+  it('reads a view body from pg_get_viewdef, without doubling the semicolon', async () => {
+    const result = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, 'a_view');
+    expect(result.ok, result.ok ? '' : result.error.message).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.kind).toBe('view');
+    expect(result.value.ddl).toHaveLength(1);
+    const statement = result.value.ddl[0] ?? '';
+    expect(statement.startsWith('create view "fixtures"."a_view" as')).toBe(true);
+    expect(statement.endsWith(';;')).toBe(false);
+    expect(statement).toMatch(/FROM fixtures\.plain_table;$/);
+  }, 30_000);
+
+  it('generates no DDL for a sequence, whose parameters it does not read', async () => {
+    const result = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, 'a_sequence');
+    expect(result.ok, result.ok ? '' : result.error.message).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.kind).toBe('sequence');
+    // `create sequence "fixtures"."a_sequence";` would be valid and wrong — it
+    // would silently drop the start, increment and cache the real one has.
+    expect(result.value.ddl).toEqual([]);
+  }, 30_000);
+
+  it('reports a missing relation as RELATION_NOT_FOUND', async () => {
+    const result = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, 'no_such_relation');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('RELATION_NOT_FOUND');
+  }, 30_000);
+
+  it('serves a cached detail, and drops it on refresh along with the tree', async () => {
+    const first = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, DETAIL_TABLE);
+    const second = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, DETAIL_TABLE);
+    expect(first.ok && second.ok).toBe(true);
+    // Identity, not equality: the second call must not have hit the server.
+    if (first.ok && second.ok) expect(second.value).toBe(first.value);
+
+    const droppedBefore = h.schemas.refresh(CONNECTION_ID);
+    expect(droppedBefore).toBeGreaterThan(0);
+
+    const third = await h.schemas.detailOf(CONNECTION_ID, SCHEMA, DETAIL_TABLE);
+    expect(third.ok).toBe(true);
+    if (first.ok && third.ok) expect(third.value).not.toBe(first.value);
+  }, 60_000);
+
+  it('reads 2,000 relations in one schema', async () => {
+    const started = now();
+    const result = await h.schemas.childrenOf(CONNECTION_ID, MANY_SCHEMA);
+    const elapsed = now() - started;
+    report(`childrenOf(${MANY_SCHEMA}) — 2000 relations`, elapsed);
+
+    expect(result.ok, result.ok ? '' : result.error.message).toBe(true);
+    if (!result.ok) return;
+    expect(result.value).toHaveLength(2_000);
+    expect(result.value.every((node) => node.kind === 'table' && !node.hasChildren)).toBe(true);
+    expect(result.value[0]?.name).toBe('t0000');
+    expect(result.value[1_999]?.name).toBe('t1999');
+    // Ordered by the server, so the renderer never has to sort 2,000 strings.
+    const names = result.value.map((node) => node.name);
+    expect(names).toEqual([...names].sort());
+    // A flat read of a whole schema must not be a per-row round trip.
+    expect(elapsed).toBeLessThan(5_000);
+  }, 60_000);
+
+  it('caches that read, so re-expanding the schema costs nothing', async () => {
+    const first = await h.schemas.childrenOf(CONNECTION_ID, MANY_SCHEMA);
+    const started = now();
+    const second = await h.schemas.childrenOf(CONNECTION_ID, MANY_SCHEMA);
+    const elapsed = now() - started;
+    report(`childrenOf(${MANY_SCHEMA}) — cached`, elapsed);
+    if (first.ok && second.ok) expect(second.value).toBe(first.value);
+    expect(elapsed).toBeLessThan(50);
+  }, 30_000);
+});

@@ -71,7 +71,15 @@ export interface SchemaNode {
 
 export interface ColumnInfo {
   readonly name: string;
+  /** `pg_type.typname` — the short name the grid's column header shows (`int8`). */
   readonly typeName: string;
+  /**
+   * `format_type(atttypid, atttypmod)` — what `\d+` prints (`bigint`,
+   * `character varying(255)`, `numeric(12,4)`). Carried alongside `typeName`
+   * because the two have different jobs: the header wants short, the detail pane
+   * and generated DDL want the modifiers.
+   */
+  readonly formattedType: string;
   readonly typeOid: number;
   readonly nullable: boolean;
   readonly defaultExpression: string | null;
@@ -95,6 +103,31 @@ export interface UniqueIndexMeta {
   readonly allColumnsNotNull: boolean;
 }
 
+/**
+ * Any index on a relation, for the detail pane (PLAN Phase 6).
+ *
+ * Wider than `UniqueIndexMeta` on purpose: it includes non-unique, expression and
+ * partial indexes, which row identity must ignore but a user reading `\d+` output
+ * expects to see. `definition` is the server's own `pg_get_indexdef` text, so it
+ * is already correctly quoted and needs no reconstruction.
+ */
+export interface IndexMeta {
+  readonly name: string;
+  readonly isPrimary: boolean;
+  readonly isUnique: boolean;
+  readonly definition: string;
+}
+
+/** `pg_constraint.contype`, minus the kinds the detail pane does not render. */
+export type ConstraintKind = 'primary' | 'unique' | 'foreign' | 'check' | 'exclusion';
+
+export interface ConstraintMeta {
+  readonly name: string;
+  readonly kind: ConstraintKind;
+  /** `pg_get_constraintdef(oid)` verbatim — the same text `\d+` prints. */
+  readonly definition: string;
+}
+
 export interface TableMeta {
   readonly schema: string;
   readonly name: string;
@@ -108,6 +141,28 @@ export interface TableMeta {
   readonly comment: string | null;
   /** Estimated rows from `pg_class.reltuples`; -1 when never analysed. */
   readonly rowEstimate: number;
+}
+
+/**
+ * Everything the Phase 6 detail pane shows for one relation.
+ *
+ * `TableMeta` stays separate rather than growing these fields because it is the
+ * **paging and row-identity** contract: `paginationKeyFor` reads it on the hot
+ * path for every browse query, and that path has no use for constraint text or
+ * generated DDL. Keeping them apart means opening a table to scroll it never pays
+ * for three extra catalog queries.
+ */
+export interface TableDetail {
+  readonly meta: TableMeta;
+  readonly kind: SchemaNodeKind;
+  readonly indexes: readonly IndexMeta[];
+  readonly constraints: readonly ConstraintMeta[];
+  /**
+   * Executable statements in dependency order — the `CREATE`, then `COMMENT ON`s.
+   * Empty for a relation whose definition Tabby cannot reproduce faithfully (see
+   * `src/main/db/ddl.ts`).
+   */
+  readonly ddl: readonly string[];
 }
 
 // ── Grid data contract ───────────────────────────────────────────────────────

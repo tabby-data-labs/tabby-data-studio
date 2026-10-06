@@ -102,8 +102,10 @@ jobs:
 
       - run: npm ci
 
-      # 10M rows plus one table per row-identity shape, type-fidelity fixture and
-      # awkward identifier. Idempotent; about a minute.
+      # 10M rows, one table per row-identity shape, type-fidelity and awkward
+      # identifier fixtures, the `detail_sample` table the Phase 6 detail pane is
+      # compared against `\d+`, and a 2,000-relation schema for the tree.
+      # Idempotent; about a minute.
       - name: Load fixtures
         run: npm run pg:fixtures
 
@@ -115,6 +117,19 @@ jobs:
       # thing in the repo that proves the columnar payload survives *Electron's*
       # serializer rather than Node's structuredClone: it decodes the raw bytes by
       # hand in the renderer and checks the typed arrays are still typed arrays.
+      # Phase 6 added a second live section for the catalog payload — that
+      # `format_type` modifiers, `pg_get_indexdef` text and the generated DDL all
+      # arrive intact on the other side of the bridge.
       # xvfb because Electron needs a display even when nothing is watched.
-      - name: Smoke with live data (columnar over real IPC)
+      - name: Smoke with live data (columnar and catalog over real IPC)
         run: xvfb-run -a npm run smoke
+
+      # Reported, not blocking, for the same reason as the verify job's bench: a
+      # frame-time gate on a shared runner is flaky. With the database configured
+      # this additionally drives the schema tree — expanding the 2,000-relation
+      # fixture schema and scrolling it for 600 frames — and prints how many rows
+      # were in the DOM. That number is Phase 6's exit criterion, so a regression
+      # here is visible in the log even though it cannot fail the build.
+      - name: Benchmark with live data (grid and tree, reported)
+        run: xvfb-run -a npm run bench
+        continue-on-error: true

@@ -179,7 +179,7 @@ export function registerIpcHandlers(services: RouterServices): () => void {
   );
 
   handle(IpcChannel.schemaTable, validateSchemaTable, (request) =>
-    services.schemas.tableOf(request.connectionId, request.schema, request.table),
+    services.schemas.detailOf(request.connectionId, request.schema, request.table),
   );
 
   handle(IpcChannel.schemaRefresh, validateConnectionId, (connectionId) =>

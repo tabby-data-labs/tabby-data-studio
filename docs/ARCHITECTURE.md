@@ -45,6 +45,7 @@ tabby/
 │  │  │  ├─ result-registry.ts   # bounded count, TTL, LRU, memory cap
 │  │  │  ├─ result-sql.ts        # cursor, keyset and OFFSET statement builders
 │  │  │  ├─ introspect.ts        # pg_catalog queries + row mappers
+│  │  │  ├─ ddl.ts               # CREATE TABLE / VIEW + COMMENT ON generation (Phase 6)
 │  │  │  ├─ sql-scan.ts          # Postgres lexical scanner (single-statement proof)
 │  │  │  ├─ session.ts           # the SET statements applied to every backend
 │  │  │  ├─ pg-config.ts         # StoredConnection → pool config, SSL mapping
@@ -60,11 +61,13 @@ tabby/
 │  │  └─ src/
 │  │     ├─ main.ts
 │  │     ├─ app/                  # shell, routing, layout
-│  │     ├─ components/           # ConnectionBar, QueryBar, ResultStatus, TabBar…
+│  │     ├─ components/           # ConnectionBar, QueryBar, ResultStatus, TabBar,
+│  │     │                        #   SchemaTree, TableDetail, TreeMenu…
 │  │     ├─ data/                 # RemoteDataSource, and the invoke() wrapper
 │  │     ├─ grid/                 # ◄── see GRID-SPEC.md; imports nothing above
+│  │     ├─ schema/               # tree-model: pure flatten/window/filter/keys (Phase 6)
 │  │     ├─ sql/                  # lexer, splitter, highlighter (Phase 7)
-│  │     ├─ stores/               # pinia: tabs, connections, results
+│  │     ├─ stores/               # pinia: tabs, connections, results, schema
 │  │     └─ styles/
 │  └─ shared/                     # imported by ALL THREE processes
 │     ├─ ipc-contract.ts          # channel names, request/response types, MainEventMap
@@ -101,9 +104,9 @@ export const IpcChannel = {
   connClose: 'conn:close',
 
   // schema
-  schemaTree: 'schema:tree',
-  schemaTable: 'schema:table', // columns, indexes, constraints, ddl
-  schemaRefresh: 'schema:refresh',
+  schemaChildren: 'schema:children', // (connectionId, parentSchema|null) → one level
+  schemaTable: 'schema:table', // columns, indexes, constraints, ddl → TableDetail
+  schemaRefresh: 'schema:refresh', // → number of cache entries dropped
 
   // queries
   queryRun: 'query:run', // → { resultId } immediately
@@ -112,6 +115,7 @@ export const IpcChannel = {
   // results (windowed — never ship a whole result set)
   resultMeta: 'result:meta', // columns + rowCountEstimate
   resultWindow: 'result:window', // (resultId, startRow, rowCount) → columnar batch
+  resultSort: 'result:sort', // server-side re-query, never a local reorder
   resultDispose: 'result:dispose',
 
   // events (main → renderer)
@@ -127,6 +131,15 @@ Rules:
 - Every response is a discriminated union: `{ ok: true, value: T } | { ok: false, error: TabbyError }`. No throwing across the bridge; thrown errors lose their shape.
 - Long operations return a **handle immediately** (`queryRun` → `resultId`) and stream progress over `evQueryProgress`. The renderer polls windows on demand.
 - Payloads crossing the bridge are size-checked; anything over a few MB must be a file path (export) or a windowed batch.
+- **The schema is read one level at a time.** `schema:children` takes a `parentSchema` (`null` for the
+  schema list) and returns exactly one level.
+
+> **Correction (Phase 6).** This section originally declared `schemaTree: 'schema:tree'`, a whole-tree
+> read. That does not survive contact with a real database: a server with 200 schemas × 2,000 tables
+> would ship hundreds of thousands of `SchemaNode`s across the bridge before the user could expand a
+> single folder. The channel is `schema:children`, the renderer loads a node when its caret is first
+> opened, and `SchemaService` caches per `(connection, parentSchema)` until an explicit
+> `schema:refresh`.
 
 ---
 
@@ -375,6 +388,82 @@ Two functions with two contracts, because one rule cannot serve both:
 > round-trip through a real query.
 
 All _values_ go through `pg`'s parameter binding (`$1, $2`), never string interpolation. Renderer-supplied SQL that is wrapped in `DECLARE … CURSOR FOR` additionally passes through the lexical scanner in `sql-scan.ts`, because a trailing `; DROP TABLE x` would otherwise leave the wrapper as two statements on the simple-query protocol.
+
+### 5.7 The catalog detail read and generated DDL (Phase 6)
+
+`schema:table` returns a `TableDetail`, not a `TableMeta`. The distinction is a performance decision,
+not a naming one:
+
+| Object        | Contents                                           | Cached in     | On the hot path?                                             |
+| ------------- | -------------------------------------------------- | ------------- | ------------------------------------------------------------ |
+| `TableMeta`   | columns, `primaryKey`, `uniqueIndexes`, estimate   | `tableCache`  | **Yes** — `paginationKeyFor` reads it for every browse query |
+| `TableDetail` | `meta` + every index + constraints + generated DDL | `detailCache` | No — only when the detail pane opens                         |
+
+Folding the extra three catalog reads into `tableOf` would have taxed every table open to pay for a
+pane the user may never click. All three caches are dropped together by `SchemaService.refresh()`.
+
+**Two index queries, on purpose.** `INDEXES_SQL` aggregates `indkey` into a column list and therefore
+_must_ exclude expression indexes (their `indkey` entries are zero) and partial indexes ("unique among
+rows matching a predicate" cannot identify a row). Those exclusions are a correctness property of row
+identity. `INDEX_DEFS_SQL` has the opposite requirement — hiding a partial unique index would hide the
+reason a duplicate insert was rejected — so it reads the server's own `pg_get_indexdef` text, which
+renders expressions and predicates correctly. `fixtures.detail_sample` carries a partial unique index
+precisely so one fixture pins both answers.
+
+**`pg_get_*` text is embedded verbatim, never rebuilt.** Re-deriving a constraint from
+`conkey`/`confkey` would mean reconstructing column order, match type, operator classes and the
+referential actions — all of which the server already renders in a form guaranteed to re-parse.
+
+> **Correction (Phase 6).** This section originally claimed the definitions "are exactly what `\d+`
+> prints". They are not. `psql` reformats both functions: it prints `CHECK (amount >= 0::numeric)`
+> where `pg_get_constraintdef` returns `CHECK ((amount >= (0)::numeric))`, and reduces an index to
+> `btree (lower(code::text))` where `pg_get_indexdef` returns the whole
+> `CREATE INDEX … USING btree (lower((code)::text))`. Two integration assertions written from real
+> `\d+` output failed against the live server. Tabby shows the catalog functions' text.
+
+`createDdl` in `src/main/db/ddl.ts` is a **reading aid, not a migration tool**. It emits `CREATE TABLE`
+plus `COMMENT ON`s for a table, `CREATE [MATERIALIZED] VIEW` from `pg_get_viewdef` for a view, and
+**nothing** for a sequence — `create sequence "s"."x";` would be valid and silently wrong, dropping the
+start, increment, bounds and cache Phase 6 does not read. An empty result is honest; a
+plausible-looking statement is not. Every identifier goes through `quoteIdent`, so a table literally
+named `x"; drop table users; --` produces a `CREATE TABLE` for that name and nothing else. Comments go
+through `quoteLiteral`, which switches to the `E'…'` form whenever the text contains a backslash or a
+control character, so the literal denotes the same thing whether or not a session has turned
+`standard_conforming_strings` off.
+
+**PostgreSQL 18 note.** 18 stores `NOT NULL` in `pg_constraint` as `contype = 'n'`, and `\d+` grew a
+"Not-null constraints" section for it. `constraintKindFor` maps `p/u/f/c/x` and returns `null` for
+everything else, so those rows are dropped: the Nullable column already carries the information, and
+rendering both would show every NOT NULL column twice.
+
+### 5.8 The virtualised schema tree (Phase 6)
+
+Hand-built in `src/renderer/src/schema/tree-model.ts`. It reuses the grid's windowing **concept** and
+none of its code — the grid is a canvas with frozen columns and a two-axis extent, the tree is a
+one-axis list of DOM rows, and `@/schema` imports nothing from `@/grid`.
+
+The split that makes 2,000 relations scroll smoothly:
+
+| Function        | Runs when                               | Cost                                             |
+| --------------- | --------------------------------------- | ------------------------------------------------ |
+| `flattenRows`   | the tree's _contents_ change            | O(nodes), and only **expanded** nodes are walked |
+| `virtualWindow` | the scroll offset changed — every frame | **O(1)** in the row count                        |
+
+A scroll therefore never re-walks the tree, and the cost of scrolling a 2,000-relation schema is
+identical to the cost of scrolling a 20-relation one. The unit test asserts this structurally
+(`virtualWindow` returns the same window for 2,000 and 200,000 rows), and the bench harness measures it
+through the real scroller.
+
+Node ids join their segments with `\u0000`. A Postgres identifier cannot contain NUL — `quoteIdent`
+refuses it — so `childNodeId` is injective and `a.b` as one name can never collide with `a` + `b` as
+two. Any printable separator would allow that collision.
+
+Accessibility is the standard virtualised-list compromise, stated rather than hidden: rows outside the
+window are not in the DOM, so each `treeitem` carries `aria-level`, `aria-posinset` and `aria-setsize`
+to describe its true position in a list the renderer can only see part of. Nesting is conveyed by
+`aria-level` rather than by nested `role="group"` elements, because the DOM is deliberately flat; the
+spacer and slice wrappers are `role="presentation"` so they do not break the `tree` → `treeitem`
+ownership chain. **No human VoiceOver pass has been done.**
 
 ---
 

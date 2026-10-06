@@ -35,25 +35,27 @@ learn from.
 
 ## Status
 
-**Phases 0–5 complete** — a hardened Electron shell, a from-scratch canvas data grid that scrolls
+**Phases 0–6 complete** — a hardened Electron shell, a from-scratch canvas data grid that scrolls
 **1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel (pointer and keyboard
 selection, five clipboard formats, context menu, cell inspector, ARIA proxy grid), a validated
 three-process IPC contract with keychain-encrypted credentials, a **real Postgres data layer**
-verified against live PostgreSQL 18, and that data layer now **drives the grid**: pick a connection,
-browse a table, scroll 10M rows at 60fps.
+verified against live PostgreSQL 18, that data layer **driving the grid** (pick a connection, browse a
+table, scroll 10M rows at 60fps), and now a **schema explorer**: a hand-built virtualised tree, a
+detail pane that matches `psql`'s `\d+`, generated DDL, and right-click actions.
 
-| Check                         | Result                                                                                                                                                       |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                                                                           |
-| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                                                                      |
-| `npm run typecheck`           | ✅ node + web projects                                                                                                                                       |
-| `npm test`                    | ✅ **954 tests**, 34 files (the 44 integration tests skip when no database is configured)                                                                    |
-| `npm run test:pg`             | ✅ **44 tests** against live PostgreSQL 18.6 — read-only enforcement, cursor jumps, cancellation, type fidelity, catalog reads, registry soak                |
-| `npm run build`               | ✅ main (3 entries) · preload · renderer                                                                                                                     |
-| `npm run smoke` (prod CSP)    | ✅ **61/61 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav, copy, IPC round-trip, 8/8 hostile payloads rejected, clean typed errors |
-| `npm run smoke:dev` (dev CSP) | ✅ **61/61** — both correctly **allowed** under the dev policy                                                                                               |
-| `npm run smoke` + a database  | ✅ **74/74** — adds 13 assertions that the columnar block survives _Electron's_ serializer with its typed arrays intact                                      |
-| `npm run bench`               | ✅ synthetic 1M×30: p95 **3.90ms** · live 200k×17: p95 **3.70ms** · live 10M×4: p95 **2.00ms** — all **60.0 fps**, 10ms budget                               |
+| Check                         | Result                                                                                                                                                          |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                                                                              |
+| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                                                                         |
+| `npm run typecheck`           | ✅ node + web projects                                                                                                                                          |
+| `npm test`                    | ✅ **1,138 tests**, 40 files (the 56 integration tests skip when no database is configured)                                                                     |
+| `npm run test:pg`             | ✅ **56 tests** against live PostgreSQL 18.6 — read-only enforcement, cursor jumps, cancellation, type fidelity, catalog reads, `\d+` fidelity, registry soak   |
+| `npm run build`               | ✅ main (3 entries) · preload · renderer                                                                                                                        |
+| `npm run smoke` (prod CSP)    | ✅ **68/68 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav, copy, IPC round-trip, 8/8 hostile payloads rejected, explorer mounts clean |
+| `npm run smoke:dev` (dev CSP) | ✅ **68/68** — both correctly **allowed** under the dev policy                                                                                                  |
+| `npm run smoke` + a database  | ✅ **93/93** — adds 13 columnar-codec and 12 catalog-payload assertions across _Electron's_ serializer                                                          |
+| `npm run bench` (grid)        | ✅ live 10M×4: p95 **2.10ms** · live 200k×17: p95 **3.40ms** · synthetic 1M×30: p95 **2.8–5.3ms** across runs — all **60.0 fps**, 10ms budget                   |
+| `npm run bench` (tree)        | ✅ **2,005 rows in the tree, 28 elements in the DOM** — p95 **1.90ms** per frame, **59.9 fps**, 0 dropped over 600 frames (8ms / 55fps budget)                  |
 
 Runtime confirmed as **Electron 44.4.5 / Chromium 152.0.7977.130 / Node 24.21.0**, with no
 `require`, `process`, `Buffer`, or `ipcRenderer` leaking into the renderer, `window.tabby` frozen,
@@ -69,11 +71,11 @@ suite asserts that `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` and `TRUNCATE`
 SQLSTATE `25006`. Measured against a 10M-row / 789 MB table: first 1000 rows in **19.1ms**, a forward
 jump to row 800,000 in **63ms**, a backward jump in **1.1ms**, `pg_cancel_backend` in **2.8ms**.
 
-**The grid boundary held.** Phase 5 swapped the synthetic source for an IPC-backed one without
-changing a byte of the grid: `git diff --stat HEAD -- src/renderer/src/grid tests/unit/grid-*.spec.ts`
-is empty. The 22 modules / ~5,000 lines in `src/renderer/src/grid/` import nothing from the app —
-enforced by an ESLint rule — and `pg` is imported by exactly one file, `src/main/db/driver-pg.ts`,
-enforced the same way.
+**The grid boundary held — twice.** Phase 5 swapped the synthetic source for an IPC-backed one, and
+Phase 6 added a whole sidebar next to it, without changing a byte of the grid:
+`git diff --stat HEAD -- src/renderer/src/grid tests/unit/grid-*.spec.ts` is empty. The 22 modules /
+~5,000 lines in `src/renderer/src/grid/` import nothing from the app — enforced by an ESLint rule —
+and `pg` is imported by exactly one file, `src/main/db/driver-pg.ts`, enforced the same way.
 
 What the grid could _not_ own turned out to be retry policy: `DataWindowController` re-requests any
 block that is neither cached nor in flight, every frame, so a permanently failing range would be
@@ -81,11 +83,30 @@ re-requested 60 times a second forever. `RemoteDataSource` holds the backoff (25
 attempts) and the terminal states — evicted, cancelled, cursor closed, connection lost — and the UI
 offers an explicit Retry rather than hammering a server that has gone away.
 
-**Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy, macOS full-screen
-restore, text crispness when dragging to a different-DPI monitor, and — new in Phase 5 — actually
-sitting in front of a live result and scrolling it. The bench and smoke harnesses drive the real DOM
-against a real database, which proves the wiring and the frame budget, but not the feel. All are
-implemented and asserted structurally in code; they need eyes.
+**The schema tree reuses the grid's windowing _concept_ and none of its code.** The grid is a canvas
+with frozen columns and a two-axis scroll extent; a tree is a one-axis list of DOM rows. What carries
+over is the split that makes both fast: `flattenRows` runs when the tree's _contents_ change, and
+`virtualWindow` — **O(1) in the row count** — runs on every scroll frame. Scrolling a 2,000-relation
+schema therefore costs exactly what scrolling a 20-relation one costs. A unit test asserts that
+structurally; the bench measures it through the real scroller.
+
+**`psql`'s `\d+` is not `pg_get_*` output.** Phase 6 aimed the detail pane at `\d+` fidelity and the
+live server disagreed: psql _reformats_ both catalog functions, printing `CHECK (amount >= 0::numeric)`
+where `pg_get_constraintdef` returns `CHECK ((amount >= (0)::numeric))`, and reducing an index to
+`btree (lower(code::text))` where `pg_get_indexdef` returns the whole `CREATE INDEX` statement. Two
+integration assertions written from real `\d+` output failed. Tabby shows the catalog functions' text —
+it is the form guaranteed to re-parse when pasted back — and the four deliberate divergences from
+`\d+` are listed in `PLAN.md` and in `TableDetail.vue`'s header rather than glossed over. PostgreSQL 18
+also stores `NOT NULL` in `pg_constraint`; those rows are dropped, because the Nullable column already
+says it and listing both would show every column twice.
+
+**Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy grid **or** the new
+`role="tree"` (the tree carries `aria-level`/`aria-posinset`/`aria-setsize`, which is the documented
+pattern for a virtualised list, but it has not been listened to), macOS full-screen restore, text
+crispness when dragging to a different-DPI monitor, and actually sitting in front of a live result —
+scrolling it, expanding a schema, clicking through the detail pane. The bench and smoke harnesses
+drive the real DOM against a real database, which proves the wiring and the frame budget, but not the
+feel. All are implemented and asserted structurally in code; they need eyes.
 
 ## Getting started
 
@@ -98,7 +119,8 @@ npm run dev        # Vite dev server + Electron with HMR
 ```bash
 npm run verify     # deps:check + lint + typecheck + test + build
 npm run smoke      # boots real Electron, asserts the security model
-npm run bench      # 600-frame scroll benchmark — run on an otherwise idle machine
+npm run bench      # 600-frame scroll benchmarks for the grid and the tree —
+                   # run on an otherwise idle machine
 npm run pack:mac   # produce a .dmg (Phase 9)
 ```
 
@@ -109,8 +131,8 @@ Prerequisites.
 
 `tests/integration/` covers the claims only a real server can settle: that read-only mode is actually
 on, that a `NO SCROLL` cursor really cannot scan backward, that the first 1000 rows of a 10M-row table
-really land inside 500ms. It **skips entirely** when no database is configured, so `npm test` stays
-green on a machine without one.
+really land inside 500ms, and that the detail pane reports a table the way the server describes it. It
+**skips entirely** when no database is configured, so `npm test` stays green on a machine without one.
 
 ```bash
 export TABBY_TEST_PG_HOST=localhost      # default
@@ -119,7 +141,10 @@ export TABBY_TEST_PG_USER=postgres       # required
 export TABBY_TEST_PG_PASSWORD=...        # required unless the server trusts you
 export TABBY_TEST_PG_DATABASE=tabby-data-test
 
-npm run pg:fixtures                     # idempotent: 10M rows + type/identity/identifier fixtures
+npm run pg:fixtures                     # idempotent, ~2s on a warm database:
+                                        #  10M rows · 200k×17 · type/identity/identifier shapes
+                                        #  detail_sample (every \d+ feature in one table)
+                                        #  fixtures_many (2,000 relations, for the tree)
 npm run test:pg
 TABBY_REPORT_PERF=1 npm run test:pg     # also print the measured latencies
 ```
@@ -128,11 +153,15 @@ The same variables switch on the **live sections of the two Electron harnesses**
 database-free:
 
 ```bash
-npm run smoke                            # +13 assertions: the columnar block survives Electron's
-                                         #  serializer with its typed arrays intact, decoded by hand
-                                         #  in the renderer
-npm run bench                            # drives the real UI — connection picker, browse box — then
-TABBY_BENCH_TABLE=fixtures.wide npm run bench   # benches the live table instead of the synthetic one
+npm run smoke                            # +25 assertions: the columnar block survives Electron's
+                                         #  serializer with its typed arrays intact (decoded by hand
+                                         #  in the renderer), and so does the catalog payload —
+                                         #  format_type modifiers, pg_get_indexdef text, the DDL
+npm run bench                            # drives the real UI — connection picker, browse box, tree
+                                         #  caret — then benches the grid AND scrolls the 2,000-row
+                                         #  tree for 600 frames, reporting rows-in-tree vs rows-in-DOM
+TABBY_BENCH_TABLE=fixtures.wide npm run bench   # benches a different live table
+TABBY_BENCH_TREE_SCHEMA=fixtures_many npm run bench   # and a different tree schema
 ```
 
 Credentials come from the environment only — nothing in this repository contains a password, and the
@@ -142,6 +171,11 @@ service container.
 The tests are read-only by construction, including the one that attempts an `INSERT` and asserts the
 server refuses it. That one targets `fixtures.read_only_probe`, a throwaway table which exists so a
 broken read-only guarantee would write there rather than into fixture data.
+
+`fixtures.detail_sample` is the other kind of fixture: it exists so an assertion can be compared
+against something a human can reproduce. Run `psql -c '\d+ fixtures.detail_sample'` and the
+integration test's expected values are on screen — with the four documented divergences listed in
+`PLAN.md` §Phase 6.
 
 ## Prerequisites
 

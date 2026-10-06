@@ -15,7 +15,7 @@ import type {
   SettingsPatch,
   SortSpec,
   StoredConnection,
-  TableMeta,
+  TableDetail,
   ThemeName,
   WindowState,
 } from './domain';
@@ -189,7 +189,15 @@ export interface DatabaseApi {
   closeConnection(connectionId: string): Promise<Result<void>>;
 
   schemaChildren(req: SchemaChildrenRequest): Promise<Result<readonly SchemaNode[]>>;
-  schemaTable(req: SchemaTableRequest): Promise<Result<TableMeta>>;
+  /**
+   * Columns, indexes, constraints, comments and generated DDL for one relation —
+   * the whole detail pane in one call, as ARCHITECTURE §3 specifies.
+   *
+   * `TableDetail.meta` is the same `TableMeta` the paging path uses. The wider
+   * fields cost three extra catalog reads, which is why main caches this
+   * separately from `tableOf` and never pays for it when merely browsing.
+   */
+  schemaTable(req: SchemaTableRequest): Promise<Result<TableDetail>>;
   /** Drops the cached catalog for one connection. Returns the number of entries freed. */
   refreshSchema(connectionId: string): Promise<Result<number>>;
 

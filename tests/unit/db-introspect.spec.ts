@@ -18,17 +18,24 @@ import {
   COLUMNS_SQL,
   CONSTRAINTS_SQL,
   INDEXES_SQL,
+  INDEX_DEFS_SQL,
   READ_ONLY_PROBE_SQL,
+  RELATION_DEF_SQL,
   SCHEMAS_SQL,
   SERVER_VERSION_SQL,
   SYSTEM_SCHEMAS,
   TABLES_SQL,
+  constraintKindFor,
   relationKindFor,
   rowEstimateFrom,
+  toConstraint,
+  toIndexMeta,
   toRelationNode,
   toSchemaFolder,
   toTableMeta,
   type ColumnRow,
+  type ConstraintRow,
+  type IndexDefRow,
   type IndexRow,
 } from '../../src/main/db/introspect';
 
@@ -39,6 +46,7 @@ function columnRow(overrides: Partial<ColumnRow> = {}): ColumnRow {
     attisdropped: false,
     attnotnull: true,
     typname: 'int4',
+    typfmt: 'integer',
     typeoid: 23,
     adsrc: null,
     comment: null,
@@ -77,7 +85,15 @@ describe('system schema exclusion', () => {
 });
 
 describe('catalog SQL invariants', () => {
-  const ALL = [SCHEMAS_SQL, TABLES_SQL, COLUMNS_SQL, INDEXES_SQL, CONSTRAINTS_SQL];
+  const ALL = [
+    SCHEMAS_SQL,
+    TABLES_SQL,
+    COLUMNS_SQL,
+    INDEXES_SQL,
+    CONSTRAINTS_SQL,
+    INDEX_DEFS_SQL,
+    RELATION_DEF_SQL,
+  ];
 
   it('reads pg_catalog, not information_schema, so it matches psql', () => {
     expect(TABLES_SQL).toContain('pg_catalog.pg_class');
@@ -103,6 +119,39 @@ describe('catalog SQL invariants', () => {
     expect(COLUMNS_SQL).toContain('$2');
     expect(INDEXES_SQL).toContain('$1');
     expect(INDEXES_SQL).toContain('$2');
+    expect(INDEX_DEFS_SQL).toContain('$1');
+    expect(INDEX_DEFS_SQL).toContain('$2');
+    expect(CONSTRAINTS_SQL).toContain('$1');
+    expect(CONSTRAINTS_SQL).toContain('$2');
+    expect(RELATION_DEF_SQL).toContain('$1');
+    expect(RELATION_DEF_SQL).toContain('$2');
+  });
+
+  it('formats column types the way psql does, not as a bare typname', () => {
+    // `\d+` prints `character varying(255)` and `numeric(12,4)`; `pg_type.typname`
+    // alone prints `varchar` and `numeric`, losing the modifiers that make the
+    // column's DDL reproducible.
+    expect(COLUMNS_SQL).toMatch(
+      /pg_catalog\.format_type\s*\(\s*att\.atttypid\s*,\s*att\.atttypmod\s*\)/i,
+    );
+  });
+
+  it('renders index definitions with pg_get_indexdef, which handles expressions', () => {
+    // INDEXES_SQL aggregates `indkey` and must therefore exclude expression and
+    // partial indexes. The detail pane shows *every* index, so it reads the
+    // server's own definition text instead of rebuilding one from attnums.
+    expect(INDEX_DEFS_SQL).toMatch(/pg_catalog\.pg_get_indexdef/i);
+    expect(INDEX_DEFS_SQL).not.toMatch(/indisunique\s*$/im);
+    expect(INDEX_DEFS_SQL).not.toContain('and idx.indisunique');
+  });
+
+  it('reads a view body with pg_get_viewdef, pretty-printed', () => {
+    expect(RELATION_DEF_SQL).toMatch(/pg_catalog\.pg_get_viewdef/i);
+    // `true` is the pretty flag; without it the whole body arrives on one line.
+    expect(RELATION_DEF_SQL).toMatch(/pg_get_viewdef\([^)]*,\s*true\s*\)/i);
+    // Restricted to the relkinds that have a definition, so a table returns no row
+    // rather than an error.
+    expect(RELATION_DEF_SQL).toMatch(/relkind\s+in\s*\(\s*'v'\s*,\s*'m'\s*\)/i);
   });
 
   it('hardcodes no specific schema or table name', () => {
@@ -359,6 +408,7 @@ describe('toTableMeta: columns', () => {
           attname: 'created_at',
           attnotnull: false,
           typname: 'timestamptz',
+          typfmt: 'timestamp with time zone',
           typeoid: 1184,
           adsrc: 'now()',
           comment: 'row creation time',
@@ -369,12 +419,43 @@ describe('toTableMeta: columns', () => {
     expect(meta.columns[0]).toEqual({
       name: 'created_at',
       typeName: 'timestamptz',
+      formattedType: 'timestamp with time zone',
       typeOid: 1184,
       nullable: true,
       defaultExpression: 'now()',
       comment: 'row creation time',
       position: 1,
     });
+  });
+
+  it('keeps the bare typname as the display type, and format_type as the DDL type', () => {
+    // The grid's column header wants the short name (`int8`); `\d+` and generated
+    // DDL want the formatted one (`bigint`). Dropping either would make one of the
+    // two views wrong, so both are carried.
+    const meta = toTableMeta({
+      schema: 's',
+      name: 't',
+      comment: null,
+      rowEstimate: -1,
+      columns: [columnRow({ typname: 'varchar', typfmt: 'character varying(255)' })],
+      indexes: [],
+    });
+    expect(meta.columns[0]?.typeName).toBe('varchar');
+    expect(meta.columns[0]?.formattedType).toBe('character varying(255)');
+  });
+
+  it('falls back to typname when the server returned no formatted type', () => {
+    for (const missing of [null, undefined, '']) {
+      const meta = toTableMeta({
+        schema: 's',
+        name: 't',
+        comment: null,
+        rowEstimate: -1,
+        columns: [columnRow({ typname: 'int4', typfmt: missing as string | null })],
+        indexes: [],
+      });
+      expect(meta.columns[0]?.formattedType, String(missing)).toBe('int4');
+    }
   });
 
   it('treats a missing nullability flag as nullable, the safe direction', () => {
@@ -550,5 +631,166 @@ describe('toTableMeta: table-level fields', () => {
       indexes: [indexRow()],
     });
     expect(JSON.parse(JSON.stringify(meta))).toEqual(meta);
+  });
+});
+
+describe('constraintKindFor', () => {
+  it('maps the pg_constraint.contype letters', () => {
+    expect(constraintKindFor('p')).toBe('primary');
+    expect(constraintKindFor('u')).toBe('unique');
+    expect(constraintKindFor('f')).toBe('foreign');
+    expect(constraintKindFor('c')).toBe('check');
+    expect(constraintKindFor('x')).toBe('exclusion');
+  });
+
+  it('returns null for the kinds the detail pane does not render', () => {
+    // 't' is a constraint trigger, which has no pg_get_constraintdef text worth
+    // showing next to a column list. An unknown letter must not become a category.
+    expect(constraintKindFor('t')).toBeNull();
+    expect(constraintKindFor('')).toBeNull();
+    expect(constraintKindFor('P')).toBeNull(); // case-sensitive: the catalog is
+    expect(constraintKindFor(null)).toBeNull();
+    expect(constraintKindFor(undefined)).toBeNull();
+    expect(constraintKindFor(112)).toBeNull();
+  });
+
+  it('drops NOT NULL, which PostgreSQL 18 also stores in pg_constraint', () => {
+    // Verified against a live server: `select pg_get_constraintdef(oid) from
+    // pg_constraint where conrelid = 'fixtures.composite_pk'::regclass` returns
+    // `NOT NULL tenant_id` and `NOT NULL seq` alongside `PRIMARY KEY (…)`. Before
+    // 18 those lived only in pg_attribute.attnotnull. Rendering them as
+    // constraints would list every NOT NULL column twice — once in the column
+    // table's "nullable" cell and once below it.
+    expect(constraintKindFor('n')).toBeNull();
+    expect(
+      toConstraint({
+        conname: 'composite_pk_tenant_id_not_null',
+        contype: 'n',
+        definition: 'NOT NULL tenant_id',
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('toConstraint', () => {
+  function constraintRow(overrides: Partial<ConstraintRow> = {}): ConstraintRow {
+    return {
+      conname: 'users_pkey',
+      contype: 'p',
+      definition: 'PRIMARY KEY (id)',
+      ...overrides,
+    };
+  }
+
+  it('keeps the server definition verbatim, because it is already correctly quoted', () => {
+    // Re-quoting `PRIMARY KEY (id)` ourselves would mean re-deriving column order
+    // and operator classes from attnums. The server's text is authoritative and is
+    // exactly what `\d+` prints.
+    const constraint = toConstraint(
+      constraintRow({
+        contype: 'f',
+        definition: 'FOREIGN KEY (owner_id) REFERENCES "Mixed Case"(id) ON DELETE CASCADE',
+      }),
+    );
+    expect(constraint).toEqual({
+      name: 'users_pkey',
+      kind: 'foreign',
+      definition: 'FOREIGN KEY (owner_id) REFERENCES "Mixed Case"(id) ON DELETE CASCADE',
+    });
+  });
+
+  it('maps every renderable kind', () => {
+    expect(
+      toConstraint(constraintRow({ contype: 'c', definition: 'CHECK ((amount > 0))' }))?.kind,
+    ).toBe('check');
+    expect(toConstraint(constraintRow({ contype: 'u', definition: 'UNIQUE (email)' }))?.kind).toBe(
+      'unique',
+    );
+    expect(
+      toConstraint(
+        constraintRow({ contype: 'x', definition: 'EXCLUDE USING gist (range_a WITH &&)' }),
+      )?.kind,
+    ).toBe('exclusion');
+  });
+
+  it('returns null for a contype it does not render, rather than inventing one', () => {
+    expect(toConstraint(constraintRow({ contype: 't' }))).toBeNull();
+    expect(toConstraint(constraintRow({ contype: 'zz' }))).toBeNull();
+  });
+
+  it('refuses a row whose definition is not a string', () => {
+    // A constraint with no definition text cannot be shown or regenerated, and
+    // silently rendering `undefined` into a DDL statement would be worse than
+    // dropping the row.
+    expect(toConstraint(constraintRow({ definition: null as unknown as string }))).toBeNull();
+    expect(toConstraint(constraintRow({ definition: 42 as unknown as string }))).toBeNull();
+  });
+
+  it('survives a null or malformed row object', () => {
+    expect(toConstraint(null as unknown as ConstraintRow)).toBeNull();
+    expect(toConstraint(undefined as unknown as ConstraintRow)).toBeNull();
+  });
+});
+
+describe('toIndexMeta', () => {
+  function indexDefRow(overrides: Partial<IndexDefRow> = {}): IndexDefRow {
+    return {
+      indexname: 'big_bucket_idx',
+      indisprimary: false,
+      indisunique: false,
+      definition: 'CREATE INDEX big_bucket_idx ON fixtures.big USING btree (bucket)',
+      ...overrides,
+    };
+  }
+
+  it('carries the flags and the server definition', () => {
+    expect(toIndexMeta(indexDefRow({ indisprimary: true, indisunique: true }))).toEqual({
+      name: 'big_bucket_idx',
+      isPrimary: true,
+      isUnique: true,
+      definition: 'CREATE INDEX big_bucket_idx ON fixtures.big USING btree (bucket)',
+    });
+  });
+
+  it('shows expression and partial indexes, which INDEXES_SQL must exclude', () => {
+    // The row-identity query cannot use these, but a user reading the detail pane
+    // has to see them: hiding a partial unique index would be hiding the reason a
+    // duplicate insert was rejected.
+    const expression = toIndexMeta(
+      indexDefRow({
+        indexname: 'label_lower_idx',
+        definition: 'CREATE INDEX label_lower_idx ON fixtures.big USING btree (lower(label))',
+      }),
+    );
+    expect(expression?.definition).toContain('lower(label)');
+
+    const partial = toIndexMeta(
+      indexDefRow({
+        indisunique: true,
+        definition: 'CREATE UNIQUE INDEX u ON s.t (a) WHERE (a IS NOT NULL)',
+      }),
+    );
+    expect(partial?.isUnique).toBe(true);
+    expect(partial?.definition).toContain('WHERE');
+  });
+
+  it('treats missing flags as false, the safe direction', () => {
+    const index = toIndexMeta(
+      indexDefRow({
+        indisprimary: undefined as unknown as boolean,
+        indisunique: undefined as unknown as boolean,
+      }),
+    );
+    expect(index).toMatchObject({ isPrimary: false, isUnique: false });
+  });
+
+  it('returns null when there is no usable definition text', () => {
+    expect(toIndexMeta(indexDefRow({ definition: null as unknown as string }))).toBeNull();
+    expect(toIndexMeta(indexDefRow({ definition: '' }))).toBeNull();
+    expect(toIndexMeta(indexDefRow({ definition: 7 as unknown as string }))).toBeNull();
+  });
+
+  it('survives a null row object', () => {
+    expect(toIndexMeta(null as unknown as IndexDefRow)).toBeNull();
   });
 });

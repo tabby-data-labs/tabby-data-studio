@@ -236,5 +236,75 @@ create table if not exists fixtures.read_only_probe (
 
 drop function if exists fixtures.slow(double precision);
 
+-- ── Phase 6: the detail pane's comparison fixture ────────────────────────────
+-- Everything `\d+` shows for one table, in one place: type modifiers that only
+-- `format_type` renders, NOT NULL, defaults, table and column comments, a primary
+-- key, a table unique constraint, a check, a foreign key, and the three index
+-- shapes that matter — plain, expression, and partial.
+--
+-- The partial unique index is the interesting one. `INDEXES_SQL` must exclude it
+-- (`indpred is null`), because "unique among rows matching a predicate" cannot
+-- identify a row; `INDEX_DEFS_SQL` must include it, because hiding it would hide
+-- the reason a duplicate insert was rejected. One object, two correct answers.
+
+create table if not exists fixtures.detail_sample (
+  id         bigint primary key,
+  tenant_id  integer not null default 1,
+  code       varchar(64) not null,
+  label      character varying(255),
+  amount     numeric(12, 4) default 0,
+  created_at timestamptz not null default now(),
+  note       text,
+  constraint detail_sample_code_uq unique (code),
+  constraint detail_sample_amount_chk check (amount >= 0),
+  constraint detail_sample_tenant_fk foreign key (tenant_id)
+    references fixtures.plain_table (id)
+);
+
+create index if not exists detail_sample_label_idx on fixtures.detail_sample (label);
+create index if not exists detail_sample_lower_code_idx on fixtures.detail_sample (lower(code));
+create unique index if not exists detail_sample_partial_uq
+  on fixtures.detail_sample (tenant_id)
+  where note is not null;
+
+comment on table fixtures.detail_sample is 'the detail-pane comparison fixture';
+comment on column fixtures.detail_sample.id is 'surrogate key';
+comment on column fixtures.detail_sample.amount is 'non-negative, enforced by a check';
+comment on column fixtures.detail_sample.note is E'nullable on purpose\nso the partial index has rows to exclude';
+
+-- ── Phase 6: the virtualised tree's scale fixture ────────────────────────────
+-- 2,000 relations in one schema. The exit criterion is that the tree renders and
+-- scrolls this smoothly, which cannot be measured against a schema with five
+-- tables: everything would fit in the viewport and the windowing would never run.
+--
+-- Created inside a DO block with `if not exists`, so a re-run is a no-op rather
+-- than an error, and the count guard means a warm database skips the loop.
+
+create schema if not exists fixtures_many;
+
+do $do$
+declare
+  existing integer;
+begin
+  select count(*) into existing
+  from pg_catalog.pg_class cls
+  join pg_catalog.pg_namespace nsp on nsp.oid = cls.relnamespace
+  where nsp.nspname = 'fixtures_many' and cls.relkind = 'r';
+
+  if existing < 2000 then
+    for i in 0..1999 loop
+      execute format(
+        'create table if not exists fixtures_many.t%s (id integer primary key, label text)',
+        lpad(i::text, 4, '0')
+      );
+    end loop;
+  end if;
+end
+$do$;
+
 select pg_catalog.pg_size_pretty(pg_catalog.pg_total_relation_size('fixtures.big')) as big_size,
-       (select count(*) from fixtures.type_matrix) as type_matrix_rows;
+       (select count(*) from fixtures.type_matrix) as type_matrix_rows,
+       (select count(*) from pg_catalog.pg_class cls
+          join pg_catalog.pg_namespace nsp on nsp.oid = cls.relnamespace
+         where nsp.nspname = 'fixtures_many' and cls.relkind = 'r') as many_tables;
+

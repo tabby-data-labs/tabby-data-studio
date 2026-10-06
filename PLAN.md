@@ -584,16 +584,92 @@ the demo grid, because the editor is Phase 7. `RemoteDataSource` has no block ca
 own, so a scroll back over recently-seen rows re-fetches whatever the grid's LRU evicted.
 Coverage remains unmeasured.
 
-### Phase 6 — Schema explorer · 5 days · ◄── NEXT
+### Phase 6 — Schema explorer · ✅ COMPLETE (2026-10-03)
 
-- Hand-built virtualised tree (reuse the grid's windowing concepts, not its code)
-- Table detail pane: columns, types, nullability, defaults, indexes, constraints, comments, generated DDL
-- Right-click → "Select top 1000", "Copy name", "Copy qualified name", "Filter to…"
-- Refresh + invalidation
+| Exit criterion                                            | Result                                                                                                                                                                                                                    |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A database with 2,000 tables renders and scrolls smoothly | **2,005 rows in the tree, 28 elements in the DOM.** Measured over 600 frames through the real scroller: p50 **1.50ms**, p95 **1.90ms**, p99 2.30ms, **59.9fps** sustained, **0 dropped** (budget: p95 < 8ms, ≥ 55fps)     |
+| The object tree matches `psql`'s `\d+` for a sample table | **Yes, with four documented divergences.** `fixtures.detail_sample` is asserted field by field against live 18.6 output: names, order, `format_type` types, nullability, defaults, descriptions, 5 indexes, 4 constraints |
 
-**Exit criteria:** a database with 2,000 tables renders and scrolls smoothly; the object tree matches `psql`'s `\d+` output for a sample table.
+Delivered:
 
-### Phase 7 — Query console · 8–12 days
+- `src/renderer/src/schema/tree-model.ts` — the pure tree: node ids joined with NUL
+  (injective, because no Postgres identifier can contain one), pre-order flattening
+  that only walks **expanded** nodes, O(1) windowing, subtree/parent lookups, the
+  WAI-ARIA keyboard transition, and single-pass filtering that keeps ancestors.
+- `src/renderer/src/stores/schema.ts` — lazy loading with in-flight dedupe, explicit
+  invalidation, a late-detail-response guard, and `connection-lost` handling.
+- `SchemaTree.vue`, `TableDetail.vue`, `TreeMenu.vue`; the detail pane is always
+  mounted so the grid never gets resized by a pane appearing.
+- `src/main/db/ddl.ts` — `createDdl` + `quoteLiteral`. Every identifier through
+  `quoteIdent`; server-rendered constraint and view text embedded verbatim.
+- `SchemaService.detailOf` with its own cache, over `INDEX_DEFS_SQL`,
+  `CONSTRAINTS_SQL` and `RELATION_DEF_SQL`; `format_type` added to `COLUMNS_SQL`.
+- Right-click: Select top 1000 · Browse all rows · Copy name · Copy qualified name ·
+  Filter to “name” · Refresh schema.
+- Fixtures: `fixtures.detail_sample` (every `\d+` shape in one table) and
+  `fixtures_many` (2,000 relations, 1.5s to create, idempotent).
+- `npm run bench` grew a tree phase; the integration job runs it reported-not-blocking.
+
+**Gate:** `deps:check` ✅ · `lint` ✅ 0/0 · `typecheck` ✅ node+web · `npm test` ✅
+**1,138 passed**, 40 files · `test:pg` ✅ **56 passed** · `build` ✅ · `smoke` ✅
+**68/68** · `smoke:dev` ✅ **68/68** · `smoke` + DB ✅ **93/93** · `bench` ✅ ·
+grid unchanged: `git diff --stat HEAD -- src/renderer/src/grid tests/unit/grid-*.spec.ts`
+is **empty**.
+
+Measured against live PostgreSQL 18.6: 2,000 relations read in **9.8ms**, cached read
+**0.0ms**.
+
+**Six findings**
+
+1. **`psql`'s `\d+` is not `pg_get_*` output.** psql _reformats_ both functions: it
+   prints `CHECK (amount >= 0::numeric)` where `pg_get_constraintdef` returns
+   `CHECK ((amount >= (0)::numeric))`, and reduces an index to
+   `btree (lower(code::text))` where `pg_get_indexdef` returns the whole
+   `CREATE INDEX … USING btree (lower((code)::text))`. Two integration assertions
+   written from `\d+` output failed against the server. Tabby shows the catalog
+   functions' text — it is the form guaranteed to re-parse — and the divergence is
+   now documented in three places rather than assumed away.
+2. **PostgreSQL 18 stores `NOT NULL` in `pg_constraint`** as `contype = 'n'`, and
+   `\d+` grew a whole "Not-null constraints" section for it. Rendering those rows
+   would list every NOT NULL column twice — once in the Nullable column, once below
+   it. `constraintKindFor` drops `'n'`, with a test that names the version.
+3. **`pg_get_viewdef(oid, true)` returns a leading space _and_ a trailing
+   semicolon.** Naively appending `;` produces `;;`. Verified on the live server
+   before the DDL tests were written.
+4. **A reverse pass cannot compute "keep a node if any descendant matches".** The
+   obvious one-loop filter loses a kept row when a non-matching _sibling_ sits
+   between it and its ancestor, because the sibling overwrites the running flag
+   before the ancestor reads it. `filterRows` is a forward pass with a depth stack.
+5. **A pane that measures itself in `onMounted` never measures at all** when its
+   element is behind a `v-else`. With no connection open the scroller does not
+   exist, `viewportHeight` stayed 0, and the window collapsed to its overscan — six
+   rows forever. The component test that mounts _before_ attaching caught it; a
+   watcher on the template ref fixes it.
+6. **An incomplete-search warning computed from the filtered rows disappears when
+   the filter matches nothing** — the exact moment the user needs to be told the
+   search only covered loaded schemas. `unsearchedSchemas` counts over the
+   unfiltered tree.
+
+**The four divergences from `\d+`,** all deliberate: (1) index and constraint
+definitions are the catalog functions' text rather than psql's reformatted version;
+(2) no Collation column; (3) no `generated … as identity` /
+`GENERATED ALWAYS AS (…) STORED` markers; (4) no "Not-null constraints" section,
+because the Nullable column already says it. Items 2 and 3 need catalog reads Phase 6
+does not make (`attcollation`, `attidentity`, `attgenerated`), and inventing a value
+would be worse than leaving the cell out. All four are documented in
+`TableDetail.vue`'s header, where the next reader will look.
+
+**Not done in Phase 6:** no human VoiceOver pass over `role="tree"` — the
+`aria-level`/`aria-setsize`/`aria-posinset` scheme is the documented pattern for a
+virtualised tree and is asserted structurally, but it has not been listened to. No
+column-level tree nodes (columns live in the detail pane). The filter searches only
+**loaded** schemas; it says so, but it does not offer to load the rest. `SchemaTree`
+has no resize handle, so the 288px sidebar is fixed. Typeahead (jump-to on character
+keys) is not implemented. DDL for sequences is deliberately absent rather than
+approximate.
+
+### Phase 7 — Query console · 8–12 days · ◄── NEXT
 
 - Editor: `<textarea>` overlay + a highlighted `<pre>` behind it, scroll-synced, with line numbers and current-line highlight
 - Hand-written Postgres lexer (~300 lines): keywords, identifiers, `"quoted idents"`, `'strings'` with `''` escapes, `$$dollar quoting$$`, `E''` escapes, numbers, operators, `--` and `/* */` comments

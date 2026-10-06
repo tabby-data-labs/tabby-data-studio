@@ -10,20 +10,34 @@
  * so two different (schema, table) pairs can never share a key.
  */
 import { err, ok, type Result } from '../../shared/errors';
-import type { SchemaNode, TableMeta } from '../../shared/domain';
+import type {
+  ConstraintMeta,
+  IndexMeta,
+  SchemaNode,
+  TableDetail,
+  TableMeta,
+} from '../../shared/domain';
 import { logError } from '../log';
 import type { ConnectionManager } from './connection-manager';
+import { createDdl } from './ddl';
 import { toTabbyError } from './pg-error';
 import {
   COLUMNS_SQL,
+  CONSTRAINTS_SQL,
   INDEXES_SQL,
+  INDEX_DEFS_SQL,
+  RELATION_DEF_SQL,
   SCHEMAS_SQL,
   TABLES_SQL,
   rowEstimateFrom,
+  toConstraint,
+  toIndexMeta,
   toRelationNode,
   toSchemaFolder,
   toTableMeta,
   type ColumnRow,
+  type ConstraintRow,
+  type IndexDefRow,
   type IndexRow,
   type RelationRow,
   type SchemaFolderRow,
@@ -41,6 +55,7 @@ export class SchemaService {
   private readonly deps: SchemaServiceDeps;
   private readonly childrenCache = new Map<string, readonly SchemaNode[]>();
   private readonly tableCache = new Map<string, TableMeta>();
+  private readonly detailCache = new Map<string, TableDetail>();
 
   constructor(deps: SchemaServiceDeps) {
     this.deps = deps;
@@ -125,6 +140,97 @@ export class SchemaService {
   }
 
   /**
+   * Everything the Phase 6 detail pane shows for one relation.
+   *
+   * Separate from {@link tableOf} rather than an extension of it, because
+   * `tableOf` sits on the paging hot path — `paginationKeyFor` reads it for every
+   * browse query — and that path has no use for constraint text or generated DDL.
+   * Folding the three extra catalog reads in would tax every table open to pay for
+   * a pane the user may never click.
+   *
+   * The relation's `kind` comes from {@link childrenOf}, which the tree has almost
+   * certainly already cached, so this costs three queries rather than four.
+   */
+  async detailOf(
+    connectionId: string,
+    schema: string,
+    table: string,
+  ): Promise<Result<TableDetail>> {
+    const key = [connectionId, schema, table].join(KEY_SEPARATOR);
+    const cached = this.detailCache.get(key);
+    if (cached) return ok(cached);
+
+    const meta = await this.tableOf(connectionId, schema, table);
+    if (!meta.ok) return err<TableDetail>(meta.error);
+
+    const siblings = await this.childrenOf(connectionId, schema);
+    if (!siblings.ok) return err<TableDetail>(siblings.error);
+    const kind = siblings.value.find((node) => node.name === table)?.kind;
+    if (kind === undefined) {
+      // `tableOf` and `childrenOf` read the same catalog, so this is not a relkind
+      // filter disagreeing — it is the two *caches* disagreeing after a concurrent
+      // DROP: `tableOf` served a meta it cached minutes ago while `childrenOf`
+      // read the catalog fresh. Reporting the relation as gone is the honest
+      // answer; inventing a kind would render a pane for an object that no longer
+      // exists.
+      return err<TableDetail>({
+        code: 'RELATION_NOT_FOUND',
+        message: `no relation "${schema}"."${table}"`,
+        connectionId,
+      });
+    }
+
+    const session = await this.deps.connections.requireSession(connectionId);
+    if (!session.ok) return err<TableDetail>(session.error);
+
+    try {
+      const [indexResult, constraintResult, definitionResult] = await Promise.all([
+        session.value.query(INDEX_DEFS_SQL, [schema, table]),
+        session.value.query(CONSTRAINTS_SQL, [schema, table]),
+        // Always sent: the query's own `relkind in ('v','m')` filter returns no
+        // rows for a table instead of raising "cannot get view definition of
+        // non-view", so branching here would only add a second code path to test.
+        session.value.query(RELATION_DEF_SQL, [schema, table]),
+      ]);
+
+      const constraints = rowsAsRecords(constraintResult)
+        .map((row) => toConstraint(row as unknown as ConstraintRow))
+        .filter((constraint): constraint is ConstraintMeta => constraint !== null);
+
+      const indexes = rowsAsRecords(indexResult)
+        .map((row) => toIndexMeta(row as unknown as IndexDefRow))
+        .filter((index): index is IndexMeta => index !== null);
+
+      const definitionRows = rowsAsRecords(definitionResult);
+      const rawDefinition = definitionRows.length > 0 ? definitionRows[0]?.['definition'] : null;
+      const viewDefinition =
+        typeof rawDefinition === 'string' && rawDefinition !== '' ? rawDefinition : null;
+
+      const detail: TableDetail = {
+        meta: meta.value,
+        kind,
+        indexes,
+        constraints,
+        ddl: createDdl({
+          schema,
+          name: table,
+          kind,
+          columns: meta.value.columns,
+          constraints,
+          comment: meta.value.comment,
+          viewDefinition,
+        }),
+      };
+
+      this.detailCache.set(key, detail);
+      return ok(detail);
+    } catch (error) {
+      logError(SCOPE, error);
+      return err<TableDetail>(toTabbyError(error, { connectionId }));
+    }
+  }
+
+  /**
    * The columns to page a table by, or null when it has none.
    *
    * **Not** the v2 `RowIdentityResolver`, and deliberately so: this picks a key for
@@ -156,7 +262,7 @@ export class SchemaService {
   /** Explicit invalidation for one connection. Returns how many entries were dropped. */
   refresh(connectionId: string): number {
     let dropped = 0;
-    for (const map of [this.childrenCache, this.tableCache]) {
+    for (const map of [this.childrenCache, this.tableCache, this.detailCache]) {
       for (const key of [...map.keys()]) {
         if (key.startsWith(`${connectionId}${KEY_SEPARATOR}`)) {
           map.delete(key);
