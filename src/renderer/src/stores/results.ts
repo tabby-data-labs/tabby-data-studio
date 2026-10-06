@@ -49,6 +49,16 @@ export const useResultsStore = defineStore('results', () => {
   const runError = ref<TabbyError | null>(null);
   /** Per-result sort failure, kept out of `runError` so it does not look like a new query failed. */
   const sortError = ref<TabbyError | null>(null);
+  /**
+   * The result id currently on the server, learned from the `planning` progress
+   * event that main emits before it acquires a client.
+   *
+   * This is what makes the Cancel button work on a runaway query: the result is not
+   * in main's registry until its first page arrives, so there is no id to cancel
+   * from the `queryRun` call itself — that call is still awaiting. Null whenever no
+   * run is in flight, which is exactly when Cancel should be disabled.
+   */
+  const inFlightId = ref<string | null>(null);
 
   let detached: Unsubscribe[] = [];
 
@@ -132,7 +142,23 @@ export const useResultsStore = defineStore('results', () => {
       return { ok: true, value: result.value.resultId };
     } finally {
       running.value = false;
+      inFlightId.value = null;
     }
+  }
+
+  /**
+   * Cancels whichever run is currently awaiting on the server.
+   *
+   * Returns the bridge's `Result` unchanged so the caller can tell "cancelled" from
+   * "there was nothing to cancel" from "the connection is gone" — collapsing those
+   * into a boolean would make a failed cancel look like a successful one.
+   */
+  async function cancelRunning(): Promise<Result<void>> {
+    const id = inFlightId.value;
+    if (id === null) {
+      return { ok: false, error: { code: 'NOT_FOUND', message: 'nothing is running' } };
+    }
+    return invoke(() => window.tabby.db.queryCancel(id), 'NOT_CONNECTED');
   }
 
   /**
@@ -186,7 +212,12 @@ export const useResultsStore = defineStore('results', () => {
         }
       }),
       events.onQueryProgress((event) => {
-        // `done` is emitted when the background count(*) lands.
+        // `done` is emitted when the background count(*) lands, long after the run
+        // settled, so it must not be read as "still in flight" — that would leave
+        // Cancel enabled for a result the user has been scrolling for minutes.
+        if (running.value && event.phase !== 'done' && event.phase !== 'failed') {
+          inFlightId.value = event.resultId;
+        }
         if (event.phase === 'done') void refreshMeta(event.resultId);
       }),
     );
@@ -206,10 +237,12 @@ export const useResultsStore = defineStore('results', () => {
     running,
     runError,
     sortError,
+    inFlightId,
     sourceOf,
     stateOf,
     syncMeta,
     run,
+    cancelRunning,
     retry,
     refreshMeta,
     close,

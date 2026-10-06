@@ -35,27 +35,33 @@ learn from.
 
 ## Status
 
-**Phases 0–6 complete** — a hardened Electron shell, a from-scratch canvas data grid that scrolls
-**1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel (pointer and keyboard
-selection, five clipboard formats, context menu, cell inspector, ARIA proxy grid), a validated
-three-process IPC contract with keychain-encrypted credentials, a **real Postgres data layer**
-verified against live PostgreSQL 18, that data layer **driving the grid** (pick a connection, browse a
-table, scroll 10M rows at 60fps), and now a **schema explorer**: a hand-built virtualised tree, a
-detail pane that matches `psql`'s `\d+`, generated DDL, and right-click actions.
+**Phases 0–6 complete, Phase 7 in progress** — a hardened Electron shell, a from-scratch canvas data
+grid that scrolls **1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel (pointer
+and keyboard selection, five clipboard formats, context menu, cell inspector, ARIA proxy grid), a
+validated three-process IPC contract with keychain-encrypted credentials, a **real Postgres data
+layer** verified against live PostgreSQL 18, that data layer **driving the grid** (pick a connection,
+browse a table, scroll 10M rows at 60fps), a **schema explorer** (hand-built virtualised tree, a detail
+pane that matches `psql`'s `\d+`, generated DDL, right-click actions), and now a **query console**: a
+hand-written Postgres lexer, a statement splitter that is not fooled by a `;` in a string, comment or
+`$$` body, a syntax-highlighted editor, one tab per statement, and a Cancel button that really stops a
+runaway query.
 
-| Check                         | Result                                                                                                                                                          |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                                                                              |
-| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                                                                         |
-| `npm run typecheck`           | ✅ node + web projects                                                                                                                                          |
-| `npm test`                    | ✅ **1,138 tests**, 40 files (the 56 integration tests skip when no database is configured)                                                                     |
-| `npm run test:pg`             | ✅ **56 tests** against live PostgreSQL 18.6 — read-only enforcement, cursor jumps, cancellation, type fidelity, catalog reads, `\d+` fidelity, registry soak   |
-| `npm run build`               | ✅ main (3 entries) · preload · renderer                                                                                                                        |
-| `npm run smoke` (prod CSP)    | ✅ **68/68 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav, copy, IPC round-trip, 8/8 hostile payloads rejected, explorer mounts clean |
-| `npm run smoke:dev` (dev CSP) | ✅ **68/68** — both correctly **allowed** under the dev policy                                                                                                  |
-| `npm run smoke` + a database  | ✅ **93/93** — adds 13 columnar-codec and 12 catalog-payload assertions across _Electron's_ serializer                                                          |
-| `npm run bench` (grid)        | ✅ live 10M×4: p95 **2.10ms** · live 200k×17: p95 **3.40ms** · synthetic 1M×30: p95 **2.8–5.3ms** across runs — all **60.0 fps**, 10ms budget                   |
-| `npm run bench` (tree)        | ✅ **2,005 rows in the tree, 28 elements in the DOM** — p95 **1.90ms** per frame, **59.9 fps**, 0 dropped over 600 frames (8ms / 55fps budget)                  |
+_Query history and the `EXPLAIN` plan tree are the two Phase 7 deliverables still missing. Both of the
+phase's exit criteria already pass — see `PLAN.md` §Phase 7._
+
+| Check                         | Result                                                                                                                                                                     |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                                                                                         |
+| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                                                                                    |
+| `npm run typecheck`           | ✅ node + web projects                                                                                                                                                     |
+| `npm test`                    | ✅ **1,252 tests**, 44 files (the 57 integration tests skip when no database is configured)                                                                                |
+| `npm run test:pg`             | ✅ **57 tests** against live PostgreSQL 18.6 — read-only enforcement, cursor jumps, cancelling a run that has not registered, type fidelity, `\d+` fidelity, registry soak |
+| `npm run build`               | ✅ main (3 entries) · preload · renderer                                                                                                                                   |
+| `npm run smoke` (prod CSP)    | ✅ **83/83 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav, copy, IPC round-trip, 8/8 hostile payloads rejected, explorer + editor mount clean    |
+| `npm run smoke:dev` (dev CSP) | ✅ **83/83** — both correctly **allowed** under the dev policy                                                                                                             |
+| `npm run smoke` + a database  | ✅ **114/114** — adds the columnar codec and catalog payload across _Electron's_ serializer, and cancels a real `pg_sleep(60)` **through the UI**                          |
+| `npm run bench` (grid)        | ✅ live 10M×4: p95 **3.40ms** · live 200k×17: p95 **2.80ms** · synthetic 1M×30: p95 **2.8–5.3ms** across runs — all **60.0 fps**, 10ms budget                              |
+| `npm run bench` (tree)        | ✅ **2,025 rows in the tree, 26 elements in the DOM** — p95 **1.90ms** per frame, **59.9 fps**, 0 dropped over 600 frames (8ms / 55fps budget)                             |
 
 Runtime confirmed as **Electron 44.4.5 / Chromium 152.0.7977.130 / Node 24.21.0**, with no
 `require`, `process`, `Buffer`, or `ipcRenderer` leaking into the renderer, `window.tabby` frozen,
@@ -100,13 +106,44 @@ it is the form guaranteed to re-parse when pasted back — and the four delibera
 also stores `NOT NULL` in `pg_constraint`; those rows are dropped, because the Nullable column already
 says it and listing both would show every column twice.
 
-**Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy grid **or** the new
+**One lexer, two consumers.** The editor's statement splitter and main's `assertSingleStatement` — the
+security control that decides whether renderer-supplied SQL may be wrapped in `DECLARE … CURSOR FOR` —
+now read the _same_ tokenizer in `src/shared/sql-lexer.ts`. Before Phase 7 main had its own hand-rolled
+loop. Rebuilding it on the shared lexer left its **31 pre-existing tests untouched and still passing**,
+which is the proof that the two cannot drift: a splitter and a validator that disagree would surface as
+the server rejecting a statement the UI had just split confidently, and that reads like a Postgres bug.
+
+**Chromium deletes a bare `\r` in parsed HTML; happy-dom does not.** Measured in Electron, not
+recalled: `innerHTML = 'a\r\nb'` yields a 3-character text node, `'a&#13;\nb'` yields 4. Without
+escaping the carriage return, a script pasted with Windows line endings would make the highlight layer
+one character shorter per line than the textarea stacked on top of it — every following line visibly
+offset — and **no unit test in this repository could ever have caught it**, because the test
+environment does not normalize. The smoke harness now asserts the two layers are character-identical
+for a CRLF script in the real renderer.
+
+**Both Electron harnesses were running with `emit: () => undefined`.** The comment said "the harness
+polls", which was true until the Cancel button needed the `planning` progress event as its only source
+of the in-flight result id. The harnesses were therefore measuring a renderer that could never receive
+an eviction, a connection-lost or a progress notice — three shipping code paths with no coverage at
+all. Wiring `emit` to `webContents.send`, exactly as production does, made the cancel test fail first
+and then pass. A related find: a result only enters main's registry once its first page arrives, so a
+runaway query — which by definition has produced nothing — could not be cancelled at all.
+`QueryService.pendingRuns` closes that; cancelling an unregistered run measures **1.1ms**.
+
+**Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy grid **or** the
 `role="tree"` (the tree carries `aria-level`/`aria-posinset`/`aria-setsize`, which is the documented
 pattern for a virtualised list, but it has not been listened to), macOS full-screen restore, text
-crispness when dragging to a different-DPI monitor, and actually sitting in front of a live result —
-scrolling it, expanding a schema, clicking through the detail pane. The bench and smoke harnesses
-drive the real DOM against a real database, which proves the wiring and the frame budget, but not the
-feel. All are implemented and asserted structurally in code; they need eyes.
+crispness when dragging to a different-DPI monitor, and — new in Phase 7 — whether the editor's
+highlight layer and its textarea actually stay aligned on a real screen at a real font size. That last
+one is asserted character-for-character in code and in Chromium, but "aligned" is ultimately a thing
+eyes confirm. The bench and smoke harnesses drive the real DOM against a real database, which proves
+the wiring and the frame budget, but not the feel.
+
+**A known gap in the perf gate, found while measuring and deliberately left alone.** The grid bench
+computes `sustainedFps` but does not fail on it: a run contaminated by a concurrent `npm run dev`
+reported **15.6 fps** and still exited 0, because only `p95 < 10ms` and `frames >= 100` are checked.
+The tree bench does gate on fps. Adding a floor to the grid bench changes a Phase 1 contract, so it is
+flagged in `PLAN.md` rather than decided in passing.
 
 ## Getting started
 

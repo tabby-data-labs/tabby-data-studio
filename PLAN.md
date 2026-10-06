@@ -669,19 +669,98 @@ has no resize handle, so the 288px sidebar is fixed. Typeahead (jump-to on chara
 keys) is not implemented. DDL for sequences is deliberately absent rather than
 approximate.
 
-### Phase 7 — Query console · 8–12 days · ◄── NEXT
+### Phase 7 — Query console · ◄── IN PROGRESS (2026-10-06) · both exit criteria met
 
-- Editor: `<textarea>` overlay + a highlighted `<pre>` behind it, scroll-synced, with line numbers and current-line highlight
-- Hand-written Postgres lexer (~300 lines): keywords, identifiers, `"quoted idents"`, `'strings'` with `''` escapes, `$$dollar quoting$$`, `E''` escapes, numbers, operators, `--` and `/* */` comments
-- **Lexer-aware statement splitter** — never split on `;` naively; `;` inside a string, comment, or dollar-quoted body must not split
-- Cmd/Ctrl+Enter runs; one result tab per statement; per-statement timing and row count
-- Cancel button wired to `pg_cancel_backend`
-- Query history (JSONL, rotated). **Privacy note:** history may contain literals including secrets — store locally, never sync, and offer a clear-history action.
-- `EXPLAIN` / `EXPLAIN ANALYZE` rendered as a plan tree
+> **Both exit criteria pass; two deliverables do not exist yet.** Marked in progress
+> rather than complete because query history and the `EXPLAIN` plan tree are listed
+> below and are not built. Everything else is done and verified.
 
-**Exit criteria:** the splitter correctly handles a script containing a `$$` function body, a `--` comment with a semicolon, and a string literal with a semicolon; cancelling a runaway query works from the UI.
+- ✅ Editor: `<textarea>` overlay + a highlighted `<pre>` behind it, scroll-synced, with line numbers and current-line highlight
+- ✅ Hand-written Postgres lexer: keywords, identifiers, `"quoted idents"`, `'strings'` with `''` escapes, `$$dollar quoting$$`, `E''` escapes, numbers, operators, `--` and `/* */` comments
+- ✅ **Lexer-aware statement splitter** — never splits on `;` naively; `;` inside a string, comment, or dollar-quoted body does not split
+- ✅ Cmd/Ctrl+Enter runs; one result tab per statement; per-statement timing in the tab title, row count in the status line
+- ✅ Cancel button wired to `pg_cancel_backend`, including for a run that has not registered yet
+- ❌ Query history (JSONL, rotated). **Privacy note:** history may contain literals including secrets — store locally, never sync, and offer a clear-history action. _Not built, so the privacy requirement is not yet in force._
+- ⚠️ `EXPLAIN` / `EXPLAIN ANALYZE` rendered as a plan tree. _Explain runs `explain (format text)` into the grid — complete information, but not a rendered tree. `EXPLAIN ANALYZE` is not wired._
 
-### Phase 8 — Export & polish · 5 days
+| Exit criterion                                                                                     | Result                                                                                                                                                                                                                 |
+| -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The splitter handles a `$$` function body, a `--` comment with a semicolon, and a literal with one | **Yes — twice over.** 28 unit cases in `sql-split.spec.ts`, and the same three asserted inside the real Chromium renderer by `npm run smoke` (`commentDoesNotSplit`, `dollarDoesNotSplit`, `escapeStringDoesNotSplit`) |
+| Cancelling a runaway query works from the UI                                                       | **Yes, driven through the buttons.** `smoke` + a database types `select pg_sleep(60)`, presses Run, waits for Cancel to go live, presses it, and reads back `QUERY_CANCELLED: canceling statement due to user request` |
+
+Delivered:
+
+- `src/shared/sql-lexer.ts` — a Postgres §4.1 lexer producing **tiling** tokens (every
+  character in exactly one token, asserted over a 45-input corpus) that never throws:
+  an unterminated literal is the normal state of an editor.
+- `src/shared/sql-split.ts` — `splitScript`, `statementAt`, `statementsToRun`, with
+  offsets satisfying `sql.slice(start, end) === text`, so a server error position maps
+  straight onto the textarea.
+- `src/main/db/sql-scan.ts` **rebuilt on the shared lexer.** Its 31 pre-existing tests
+  were not touched and all still pass — that is the proof the editor's splitter and
+  main's security control cannot drift apart.
+- `src/renderer/src/sql/highlight.ts` — token → HTML, escaping `&`, `<`, `>` and `\r`,
+  plus the line geometry the gutter and current-line rule need.
+- `QueryEditor.vue` — transparent-text textarea over a highlighted `<pre>`, gutter,
+  current-line rule, scroll sync as a direct DOM write, Run / Run all / Explain /
+  Cancel, ⌘↵ and ⇧⌘↵.
+- One result tab per statement, run sequentially, stopping at the first failure rather
+  than cascading.
+- `QueryService.pendingRuns`, so a run can be cancelled before it registers.
+
+**Gate:** `deps:check` ✅ · `lint` ✅ 0/0 · `typecheck` ✅ node+web · `npm test` ✅
+**1,252 passed**, 44 files · `test:pg` ✅ **57 passed** · `build` ✅ · `smoke` ✅
+**83/83** · `smoke:dev` ✅ **83/83** · `smoke` + DB ✅ **114/114** · `bench` ✅ ·
+grid unchanged: `git diff --stat HEAD -- src/renderer/src/grid tests/unit/grid-*.spec.ts`
+is **empty**.
+
+Live benchmarks, driven through the schema tree, 600 frames each:
+
+| Source                                        | p50  | p95        | p99  | fps   | dropped | measureText |
+| --------------------------------------------- | ---- | ---------- | ---- | ----- | ------- | ----------- |
+| live `fixtures.big` 10M×4 (browse)            | 1.90 | **3.40ms** | 4.80 | 60.02 | 1       | 59,896      |
+| live `fixtures.wide` 200k×17 (browse)         | 2.30 | **2.80ms** | 3.10 | 60.02 | 1       | 294,929     |
+| schema tree, 2,025 rows → **26 DOM elements** | 1.40 | **1.90ms** | 2.10 | 59.88 | 0       | —           |
+
+**Five findings**
+
+1. **Chromium's HTML parser silently deletes a bare `\r`; happy-dom does not.**
+   `innerHTML = 'a\r\nb'` yields a 3-character text node, `'a&#13;\nb'` yields 4 —
+   measured in Electron, not recalled. A script pasted with Windows line endings would
+   have made the highlight layer one character shorter per line than the textarea behind
+   it, offsetting every following line, and **no unit test could ever have caught it**
+   because the test environment does not normalize. Fixed by escaping `\r` as `&#13;`;
+   the smoke harness now asserts the two layers are character-identical for a CRLF
+   script in the real renderer.
+2. **Both Electron harnesses had `emit: () => undefined`.** The comment said "the
+   harness polls", which held until the Cancel button needed the `planning` progress
+   event as its only source of the in-flight result id. The harnesses were measuring a
+   renderer that could never receive an eviction, a connection-lost or a progress
+   notice — three shipping code paths with no coverage. Wiring `emit` to
+   `webContents.send`, as production does, made the cancel test fail first and then pass.
+3. **A result could not be cancelled while it was running.** It enters the registry only
+   after its first page arrives, so `cancel(resultId)` answered `RESULT_NOT_FOUND` for
+   precisely the runaway queries the button exists for. `pendingRuns` closes that; a live
+   test cancels an unregistered run in **1.1ms** and the client comes back to the pool.
+4. **`:` is not in the Postgres manual's operator-character list, but must be treated as
+   one.** Without it `::` lexes as two one-character operators and `a::text` colours as
+   three unrelated tokens.
+5. **`E'…'` is only a prefix when it starts a token.** Reading the `E` in `fooE'x'` as an
+   escape-string prefix changes where the string ends. Guarded on the preceding character.
+
+**Also not built:** no syntax-error underlining at `TabbyError.position`, though the
+splitter now preserves the offsets that would make it possible. No autocomplete, no
+typeahead. Tab is deliberately **not** intercepted — inserting spaces there would trap
+keyboard focus in the pane, which is an accessibility failure rather than a nicety.
+
+**A gate weakness found while measuring, and deliberately not fixed.** The grid bench
+computes `sustainedFps` but never gates on it: a run contaminated by a concurrent
+`npm run dev` reported **15.6 fps** and still exited 0 with `failures: []`, because only
+`p95 < 10ms` and `frames >= 100` are checked. The tree bench _does_ gate on fps (`>= 55`).
+A conservative fps floor belongs in the grid bench too, but that changes a Phase 1 perf
+contract and is a decision to make deliberately, not in passing.
+
+### Phase 8 — Export & polish · 5 days · ◄── NEXT
 
 - Streamed export to CSV / JSON / SQL `INSERT` / TSV, writing directly to disk from main (never through the renderer), with progress and cancel
 - RFC 4180-correct CSV quoting; configurable delimiter, encoding, NULL representation, header row

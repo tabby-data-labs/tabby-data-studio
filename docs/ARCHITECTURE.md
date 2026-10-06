@@ -61,12 +61,12 @@ tabby/
 │  │  └─ src/
 │  │     ├─ main.ts
 │  │     ├─ app/                  # shell, routing, layout
-│  │     ├─ components/           # ConnectionBar, QueryBar, ResultStatus, TabBar,
+│  │     ├─ components/           # ConnectionBar, QueryEditor, ResultStatus, TabBar,
 │  │     │                        #   SchemaTree, TableDetail, TreeMenu…
 │  │     ├─ data/                 # RemoteDataSource, and the invoke() wrapper
 │  │     ├─ grid/                 # ◄── see GRID-SPEC.md; imports nothing above
 │  │     ├─ schema/               # tree-model: pure flatten/window/filter/keys (Phase 6)
-│  │     ├─ sql/                  # lexer, splitter, highlighter (Phase 7)
+│  │     ├─ sql/                  # highlight layer; the lexer + splitter are in shared/
 │  │     ├─ stores/               # pinia: tabs, connections, results, schema
 │  │     └─ styles/
 │  └─ shared/                     # imported by ALL THREE processes
@@ -75,6 +75,8 @@ tabby/
 │     ├─ columnar.ts              # the transfer codec: main encodes, renderer decodes
 │     ├─ pg-types.ts              # OID table, encoding choice, value normalisation
 │     ├─ ident.ts                 # quoteIdent — main quotes, renderer builds browse SQL
+│     ├─ sql-lexer.ts             # Postgres §4.1 tokenizer; tiling, never throws
+│     ├─ sql-split.ts             # statement splitter + caret/selection resolution
 │     └─ errors.ts                # tagged error union
 └─ tests/
    ├─ unit/
@@ -464,6 +466,64 @@ to describe its true position in a list the renderer can only see part of. Nesti
 `aria-level` rather than by nested `role="group"` elements, because the DOM is deliberately flat; the
 spacer and slice wrappers are `role="presentation"` so they do not break the `tree` → `treeitem`
 ownership chain. **No human VoiceOver pass has been done.**
+
+### 5.9 One lexer, two consumers (Phase 7)
+
+`src/shared/sql-lexer.ts` tokenizes Postgres SQL per §4.1 of the manual. It lives in `shared` because
+two consumers need the _same_ answer and must not be allowed to drift:
+
+| Consumer                            | Question it answers                                 | Consequence of being wrong                                 |
+| ----------------------------------- | --------------------------------------------------- | ---------------------------------------------------------- |
+| `src/main/db/sql-scan.ts`           | may this text be wrapped in `DECLARE … CURSOR FOR`? | a second statement runs on the simple-query protocol       |
+| `src/renderer/src/sql/highlight.ts` | which characters get which colour?                  | the editor colours a keyword inside a string literal       |
+| `src/shared/sql-split.ts`           | where does one statement end and the next begin?    | the console sends a fragment of a function body as a query |
+
+Before Phase 7 the scanner held its own hand-rolled loop. Rebuilding it on the shared lexer — with its
+**31 pre-existing tests untouched and still passing** — is what makes the three rows above one row. A
+splitter and a validator that disagree would surface as the server rejecting a statement the UI had
+just split confidently, which reads like a Postgres bug and is not.
+
+Three properties the lexer holds that its consumers rely on:
+
+- **Tokens tile the input.** Every character is in exactly one token, in order, with no gaps or
+  overlaps. Asserted over a 45-input corpus rather than once, because a gap is unstyled text and an
+  overlap is text rendered twice — both invisible in a screenshot of a query that happens not to hit
+  the case.
+- **It never throws.** A half-typed query is the normal state of an editor, so an unterminated
+  construct is reported in `error` and its token runs to end of input. `sql-scan.ts` is the caller that
+  _must_ refuse such input, and it converts the report into a thrown `SqlStructureError`.
+- **The NUL check runs before lexing, not during.** Postgres rejects a NUL anywhere in the query text
+  because that text is a C string, so one buried inside a literal is just as fatal as one at top level.
+  Reporting the literal as "unterminated" instead would send the user to fix the wrong thing.
+
+`highlight.ts` renders those tokens to HTML for the `<pre>` behind a transparent-text `<textarea>`. Two
+rules make that safe and correct:
+
+- It escapes `&`, `<` and `>` — the output is assigned to `innerHTML`, so escaping is a security
+  boundary, not a nicety. The `vue/no-v-html` rule is disabled for that one file in `eslint.config.mjs`
+  with the justification recorded there.
+- It escapes `\r` as `&#13;`. **Chromium's HTML parser normalizes a bare carriage return away and
+  happy-dom does not**, so `innerHTML = 'a\r\nb'` yields a 3-character text node where the textarea
+  holds 4. A Windows-line-ending paste would offset every line after the first, and no unit test in
+  this repository could catch it. The smoke harness asserts the two layers are character-identical for
+  a CRLF script in the real renderer, which is the only place it can be proved.
+
+### 5.10 Cancelling a run that has not registered yet (Phase 7)
+
+`QueryService` puts a result in the registry only after its first page has arrived. That is the right
+time to start accounting for its memory — and it means a runaway query, which by definition has
+produced no rows, is not in the registry and cannot be cancelled by id. `cancel` answered
+`RESULT_NOT_FOUND` for exactly the queries the Cancel button exists for.
+
+`pendingRuns` closes the gap: the id is recorded before the `planning` progress event is emitted, and
+the backend pid is filled in as soon as a client is acquired. The renderer learns the id from that
+event, which is the only channel it has — the `queryRun` call is still awaiting. Cancelling an
+unregistered run measures **1.1ms** against a live server, and the client returns to the pool.
+
+There is one window where cancellation genuinely cannot work: between `run()` starting and the client
+being acquired, there is no backend to signal. That returns
+`NOT_FOUND: the query has not reached the server yet` rather than reporting success for a cancel that
+could not have reached anything.
 
 ---
 

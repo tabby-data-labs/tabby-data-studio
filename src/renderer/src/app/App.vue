@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import { quoteQualified } from '@shared/ident';
+import type { SqlStatement } from '@shared/sql-split';
 import ConnectionBar from '@/components/ConnectionBar.vue';
 import DataGridVue from '@/components/DataGridVue.vue';
-import QueryBar from '@/components/QueryBar.vue';
+import QueryEditor from '@/components/QueryEditor.vue';
 import ResultStatus from '@/components/ResultStatus.vue';
 import SchemaTree from '@/components/SchemaTree.vue';
 import TabBar from '@/components/TabBar.vue';
@@ -143,6 +144,103 @@ async function onRun(input: RunInput): Promise<void> {
     title: input.title,
     connectionId: input.connectionId,
   });
+}
+
+// ── Query console (Phase 7) ──────────────────────────────────────────────────
+
+const runningTitle = ref<string | null>(null);
+/** Set when the user cancels, so the rest of a multi-statement script is skipped. */
+let cancelled = false;
+
+const runningLabel = computed(() =>
+  results.running && runningTitle.value !== null ? runningTitle.value : null,
+);
+
+/** First line, collapsed and truncated — the tab has to stay readable. */
+function titleFor(statement: SqlStatement): string {
+  const firstLine = statement.text.split('\n', 1)[0] ?? '';
+  const collapsed = firstLine.replace(/\s+/g, ' ').trim();
+  return collapsed.length > 60 ? `${collapsed.slice(0, 57)}…` : collapsed;
+}
+
+/**
+ * Runs a script one statement at a time, opening a tab per statement.
+ *
+ * Sequential, not parallel: five tabs filling at once would need five pooled
+ * clients, and a script whose second statement depends on the first would race it.
+ *
+ * Stops at the first failure rather than continuing. Running the rest of a script
+ * after a statement has failed almost always produces a cascade of errors that
+ * obscure the real one, and — since v1 is read-only but a `create`/`drop` script is
+ * still refused rather than ignored — continuing would only add noise.
+ */
+async function onRunStatements(statements: readonly SqlStatement[]): Promise<void> {
+  const connectionId = connections.activeId;
+  if (connectionId === null || statements.length === 0) return;
+
+  notice.value = null;
+  cancelled = false;
+
+  for (const statement of statements) {
+    if (cancelled) break;
+    const title = titleFor(statement);
+    runningTitle.value = title;
+
+    const started = await results.run({
+      connectionId,
+      sql: statement.text,
+      title,
+      initialRows: INITIAL_ROWS,
+    });
+
+    if (!started.ok) {
+      if (started.error.code === 'QUERY_CANCELLED') {
+        cancelled = true;
+        notice.value = 'Cancelled';
+      }
+      break;
+    }
+
+    const id = started.value;
+    const meta = results.metas.get(id);
+    tabs.openResult({
+      resultId: id,
+      // Per-statement timing in the tab, so five results can be compared without
+      // clicking through them. The row count is not here on purpose: it arrives
+      // later from the background count and the status line already shows it.
+      title: meta === undefined ? title : `${title} · ${meta.elapsedMs}ms`,
+      connectionId,
+    });
+  }
+
+  runningTitle.value = null;
+}
+
+/**
+ * `EXPLAIN` as an ordinary query, which is exactly what `psql` shows: one text row
+ * per plan line, in the grid, selectable and copyable.
+ *
+ * Not the rendered plan tree PLAN describes — see the Phase 7 notes. Text form is
+ * the honest interim: it is complete information, just not pretty.
+ */
+async function onExplain(statement: SqlStatement): Promise<void> {
+  const connectionId = connections.activeId;
+  if (connectionId === null) return;
+  await onRun({
+    connectionId,
+    sql: `explain (format text) ${statement.text}`,
+    title: `explain · ${titleFor(statement)}`,
+    initialRows: INITIAL_ROWS,
+  });
+}
+
+async function onCancel(): Promise<void> {
+  const result = await results.cancelRunning();
+  if (result.ok) return;
+  // NOT_FOUND here means the run settled between the click and the bridge call,
+  // which is a success from the user's point of view, not something to report.
+  if (result.error.code === 'NOT_FOUND') return;
+  notice.value = `Cancel failed: ${result.error.message}`;
 }
 
 function onCloseResult(resultId: string): void {
@@ -407,7 +505,7 @@ function onGoToRow(): void {
     <header class="flex items-baseline gap-3 border-b border-line bg-panel px-4 py-2">
       <h1 class="text-sm font-semibold tracking-wide text-fg">Tabby</h1>
       <span class="text-xs text-muted">
-        Phase 6 — {{ liveResultId === null ? 'synthetic grid' : 'live result' }}
+        Phase 7 — {{ liveResultId === null ? 'synthetic grid' : 'live result' }}
       </span>
       <span class="ml-auto text-[11px] text-muted">
         {{ headerSummary }}
@@ -418,11 +516,19 @@ function onGoToRow(): void {
     </header>
 
     <ConnectionBar />
-    <QueryBar :connection-id="connections.activeId" :busy="results.running" @run="onRun" />
+    <QueryEditor
+      :connection-id="connections.activeId"
+      :busy="results.running"
+      :running-label="runningLabel"
+      @run="onRunStatements"
+      @explain="onExplain"
+      @cancel="onCancel"
+    />
 
     <div
       v-if="results.runError"
       class="flex items-center gap-3 border-b border-line bg-panel px-4 py-1.5 text-[11px] text-warn"
+      data-run-error
     >
       <span>{{ results.runError.code }}: {{ results.runError.message }}</span>
     </div>

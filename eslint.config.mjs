@@ -123,6 +123,17 @@ export default tseslint.config(
     rules: { 'no-restricted-imports': 'off' },
   },
 
+  // The query editor's highlight layer is a `<pre>` of generated HTML stacked behind
+  // a transparent-text textarea — that is the design, so `v-html` is not a mistake
+  // here. The HTML comes only from `src/renderer/src/sql/highlight.ts`, which escapes
+  // `&`, `<` and `>` in every token kind and is asserted to reproduce its input
+  // character for character (including an injected `<img onerror>`) in
+  // tests/unit/sql-highlight.spec.ts. Scoped to the one file, and documented there.
+  {
+    files: ['src/renderer/src/components/QueryEditor.vue'],
+    rules: { 'vue/no-v-html': 'off' },
+  },
+
   // Global house rules. Must come before any block that relaxes them, because
   // in flat config the LAST matching object wins.
   {

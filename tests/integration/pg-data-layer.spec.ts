@@ -457,6 +457,53 @@ describe.skipIf(!pgConfigured)('live postgres · cancellation', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe('RESULT_NOT_FOUND');
   });
+
+  it('cancels a query that has not produced its first page yet', async () => {
+    // The actual runaway case from the UI: the user is staring at a spinner, and
+    // the result is **not in the registry** because no rows have arrived. Before
+    // Phase 7 this answered RESULT_NOT_FOUND — the cancel button did nothing
+    // exactly when it was needed. The renderer learns the id from the `planning`
+    // progress event, which main emits before it acquires a client.
+    const from = h.events.length;
+    const running = h.queries.run({
+      connectionId: CONNECTION_ID,
+      sql: 'select g as n, pg_sleep(0.05) as waited from generate_series(1, 2000) as g',
+      initialRows: 2_000,
+    });
+
+    const startedAt = now();
+    let resultId: string | null = null;
+    while (resultId === null && now() - startedAt < 10_000) {
+      const event = h.events
+        .slice(from)
+        .find(
+          (candidate) =>
+            candidate.channel === 'event:query-progress' &&
+            (candidate.payload as { phase?: string }).phase === 'planning',
+        );
+      if (event) resultId = (event.payload as { resultId: string }).resultId;
+      else await sleep(10);
+    }
+    expect(resultId, 'main should have announced the run before it finished').not.toBeNull();
+    if (resultId === null) return;
+
+    // Give the server something to be doing, then cancel while it is still doing it.
+    await sleep(500);
+    const started = now();
+    const cancelled = await h.queries.cancel(resultId);
+    const cancelElapsed = now() - started;
+    expect(cancelled.ok, cancelled.ok ? '' : cancelled.error.message).toBe(true);
+    report('queryCancel on an unregistered run', cancelElapsed);
+    expect(cancelElapsed, `${cancelElapsed}ms`).toBeLessThan(200);
+
+    const outcome = await running;
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.error.code).toBe('QUERY_CANCELLED');
+
+    // The client came back: otherwise the pool would leak one connection per
+    // cancelled query, and a user who cancels ten times would exhaust it.
+    expect(await idleInTransactionBackends(h)).toBe(0);
+  }, 60_000);
 });
 
 describe.skipIf(!pgConfigured)('live postgres · type fidelity', () => {

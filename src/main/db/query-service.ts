@@ -151,6 +151,15 @@ export class QueryService {
   private readonly countQueues = new Map<string, Promise<void>>();
   /** In-flight cursor releases, so teardown can await them instead of racing. */
   private readonly pendingReleases = new Set<Promise<void>>();
+  /**
+   * Runs that have a result id but are not in the registry yet.
+   *
+   * A result is only registered once its first page has arrived, which is precisely
+   * when a slow query is still running — so without this a `cancel` for the query
+   * the user is watching would answer RESULT_NOT_FOUND. The renderer learns the id
+   * from the `planning` progress event, emitted before the handle is acquired.
+   */
+  private readonly pendingRuns = new Map<string, { connectionId: string; pid: number | null }>();
 
   constructor(deps: QueryServiceDeps) {
     this.deps = deps;
@@ -181,12 +190,18 @@ export class QueryService {
     const resultId = this.newResultId();
     const startedAt = Date.now();
     const initialRows = clampRows(request.initialRows ?? DEFAULT_INITIAL_ROWS);
+    // Registered before the progress event, so a cancel arriving in response to
+    // that event finds something to look at rather than RESULT_NOT_FOUND.
+    this.pendingRuns.set(resultId, { connectionId: request.connectionId, pid: null });
     this.progress(resultId, 'planning', 0);
 
     let handle: PgClientHandle;
     try {
       handle = await session.acquire();
+      const pending = this.pendingRuns.get(resultId);
+      if (pending) this.pendingRuns.set(resultId, { ...pending, pid: handle.backendPid });
     } catch (error) {
+      this.pendingRuns.delete(resultId);
       return err<QueryRunResponse>(toTabbyError(error, { connectionId: request.connectionId }));
     }
 
@@ -224,6 +239,9 @@ export class QueryService {
         payload: state,
         bytesHeld: bytes,
       });
+      // From here the registry owns cancellation; keeping the pending entry would
+      // let a stale pid be cancelled after the run had moved on.
+      this.pendingRuns.delete(resultId);
       if (!accepted) {
         await this.releaseQuietly(state);
         return err<QueryRunResponse>({
@@ -241,6 +259,7 @@ export class QueryService {
       logInfo(SCOPE, `result ${resultId} ready in ${state.elapsedMs}ms via ${state.paging.kind}`);
       return ok({ resultId, meta: this.metaOf(state) });
     } catch (error) {
+      this.pendingRuns.delete(resultId);
       await this.releaseQuietly(state);
       logError(SCOPE, error);
       return err<QueryRunResponse>(
@@ -500,21 +519,38 @@ export class QueryService {
    */
   async cancel(resultId: string): Promise<Result<void>> {
     const entry = this.registry.get(resultId);
-    if (!entry) return err<void>(this.missingResult(resultId));
-    const state = entry.payload;
+    const pending = this.pendingRuns.get(resultId);
+    if (!entry && !pending) return err<void>(this.missingResult(resultId));
 
-    const session = this.deps.connections.session(state.connectionId);
+    const connectionId = entry ? entry.payload.connectionId : (pending?.connectionId ?? '');
+    const session = this.deps.connections.session(connectionId);
     if (!session) {
       return err<void>({
         code: 'CONN_LOST',
         message: 'the connection for this result is no longer open',
-        connectionId: state.connectionId,
+        connectionId,
         resultId,
       });
     }
 
-    const result = await session.cancel(state.handle.backendPid);
-    if (result.ok) this.progress(resultId, 'failed', 0);
+    // A run cancelled before its client was acquired has no backend to signal.
+    // That window is milliseconds wide on a warm pool, and saying so beats
+    // reporting success for a cancel that could not have reached the server.
+    const pid = entry ? entry.payload.handle.backendPid : pending?.pid;
+    if (typeof pid !== 'number') {
+      return err<void>({
+        code: 'NOT_FOUND',
+        message: 'the query has not reached the server yet',
+        connectionId,
+        resultId,
+      });
+    }
+
+    const result = await session.cancel(pid);
+    if (result.ok) {
+      this.pendingRuns.delete(resultId);
+      this.progress(resultId, 'failed', 0);
+    }
     return result;
   }
 
@@ -537,6 +573,7 @@ export class QueryService {
   }
 
   dispose(resultId: string): Result<void> {
+    this.pendingRuns.delete(resultId);
     const entry = this.registry.get(resultId);
     if (!entry) return err<void>(this.missingResult(resultId));
     // `delete` fires onEvict, which closes the cursor and releases the client, so
@@ -549,6 +586,11 @@ export class QueryService {
   dropConnection(connectionId: string): void {
     for (const resultId of this.registry.idsForConnection(connectionId)) {
       this.registry.delete(resultId);
+    }
+    // A run still in flight on a dead connection will never register, so its
+    // pending entry would otherwise outlive the pool it belonged to.
+    for (const [resultId, pending] of this.pendingRuns) {
+      if (pending.connectionId === connectionId) this.pendingRuns.delete(resultId);
     }
     this.deps.emit(IpcChannel.evConnectionLost, { connectionId });
   }

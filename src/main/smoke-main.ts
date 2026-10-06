@@ -122,8 +122,21 @@ app
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
     // The same object graph the real app builds, so the harness cannot pass on a
-    // wiring the shipped binary does not use. `emit` is dropped: the harness polls.
-    const db = createDbServices({ settings, emit: () => undefined });
+    // wiring the shipped binary does not use.
+    //
+    // `emit` forwards to the window exactly as `src/main/index.ts` does. It used to
+    // be a no-op here on the reasoning that "the harness polls" — which was true
+    // until Phase 7, where the Cancel button's only source of the in-flight result
+    // id is the `planning` progress event. With `emit` dropped, the harness was
+    // measuring a renderer that could never receive an eviction, a connection-lost
+    // or a progress notice: three code paths shipping untested. Wiring it makes the
+    // harness match production instead of a simpler thing that passes.
+    const db = createDbServices({
+      settings,
+      emit: (channel, payload) => {
+        if (!win.isDestroyed()) win.webContents.send(channel, payload);
+      },
+    });
     const disposeIpc = registerIpcHandlers({
       settings,
       window: () => win,
@@ -338,6 +351,92 @@ app
     };
   })()`)) as Record<string, unknown>;
 
+    // ── Query editor (Phase 7) ───────────────────────────────────────────────
+    // Types real SQL into the real textarea under the production CSP and reads back
+    // what the highlight layer did with it.
+    //
+    // Two things only this harness can settle. First, that `v-html` on the
+    // highlight layer does not become an injection vector in the shipped renderer:
+    // the escaping is unit-tested, but the unit test runs in happy-dom, not in
+    // Chromium with the prod policy. Second, that the lexer-aware splitter agrees
+    // with main's `assertSingleStatement` *in the app* — a semicolon inside a
+    // string, a comment or a `$$` body must not become a statement boundary, or the
+    // editor would send a fragment main then refuses.
+    const editor = (await win.webContents.executeJavaScript(`(async () => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const pane = document.querySelector('[data-query-editor]');
+    const area = document.querySelector('[data-sql-input]');
+    if (!pane || !area) return { present: false };
+
+    const pre = () => document.querySelector('[data-highlight]');
+    const count = () => {
+      const meta = pane.querySelector('[data-statement-count]');
+      return meta ? Number(meta.getAttribute('data-statement-count')) : -1;
+    };
+    const type = async (text) => {
+      area.value = text;
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(80);
+    };
+
+    const out = { present: true };
+
+    out.hasHighlightLayer = !!pre();
+    out.hasGutter = !!pane.querySelector('.gutter');
+    out.hasCurrentLine = !!pane.querySelector('.current-line');
+
+    const source = "select 'a;b' from t";
+    await type(source);
+    out.statementCount = count();
+    out.spanCount = pre().querySelectorAll('span').length;
+    // The highlight layer must contain exactly the source characters, or the caret
+    // visibly separates from the text it is supposed to sit on.
+    out.renderedText = pre().textContent;
+    out.textMatchesSource = pre().textContent === source;
+    out.hasKeywordSpan = !!pre().querySelector('.tok-keyword');
+    out.hasStringSpan = !!pre().querySelector('.tok-string');
+
+    // A semicolon in a string, a line comment and a dollar body: one statement each.
+    await type('select 1; -- a ; in a comment');
+    out.commentDoesNotSplit = count() === 1;
+    await type('select $$ a ; b $$');
+    out.dollarDoesNotSplit = count() === 1;
+    await type("select E'a\\\\';b'");
+    out.escapeStringDoesNotSplit = count() === 1;
+    await type('select 1; select 2;');
+    out.realSeparatorSplits = count() === 2;
+
+    // Injection: the source is HTML-looking text, and must stay text.
+    await type('<img src=x onerror="alert(1)">');
+    out.injectedElements = pre().querySelectorAll('img').length;
+    out.escapedAngle = pre().innerHTML.includes('&lt;');
+
+    // Unterminated input is the normal state of an editor: report it, do not throw.
+    await type("select 'abc");
+    out.unterminatedReported = !!pane.querySelector('[data-lex-error]');
+    out.unterminatedStillHighlighted = pre().querySelectorAll('span').length > 0;
+
+    // CRLF, checked against the textarea rather than against a literal: the
+    // invariant is that the two layers agree, whatever the DOM does to either.
+    // Chromium's HTML parser normalizes a bare \\r in parsed content away, which
+    // happy-dom does not — so this is the only place the escaping is really proved.
+    await type('select 1\\r\\nfrom t');
+    out.crlfTextMatches = pre().textContent === area.value;
+    out.crlfRenderedLength = pre().textContent.length;
+    out.crlfSourceLength = area.value.length;
+
+    await type('');
+    out.runPresent = !!pane.querySelector('[data-run]');
+    out.runAllPresent = !!pane.querySelector('[data-run-all]');
+    out.explainPresent = !!pane.querySelector('[data-explain]');
+    const cancel = pane.querySelector('[data-cancel]');
+    out.cancelPresent = !!cancel;
+    // Nothing is running, so Cancel must be inert rather than clickable.
+    out.cancelDisabled = cancel ? cancel.disabled : false;
+    out.runDisabled = pane.querySelector('[data-run]').disabled;
+    return out;
+  })()`)) as Record<string, unknown>;
+
     // ── IPC round-trip ─────────────────────────────────────────────────────────
     // Exercises the production path end to end: renderer -> contextBridge ->
     // ipcMain -> validator -> SettingsStore -> Result back. Also proves a hostile
@@ -464,6 +563,113 @@ app
     const pgUser = process.env['TABBY_TEST_PG_USER'] ?? '';
     const pgDatabase = process.env['TABBY_TEST_PG_DATABASE'] ?? '';
     const liveConfigured = pgUser !== '' && pgDatabase !== '';
+
+    /**
+     * Phase 7's second exit criterion, from the UI: **cancelling a runaway query**.
+     *
+     * The integration suite already proves `pg_cancel_backend` reaches the server in
+     * ~1ms, including for a run that has not registered yet. That is not the same
+     * claim. This drives the actual buttons — type a slow query, press Run, wait for
+     * Cancel to become live, press it — and reads back the error banner the app
+     * shows. It is the only place where "the cancel button works" is a measured
+     * fact rather than an inference from wiring.
+     *
+     * `pg_sleep(60)` is used rather than a fixture function for the reason recorded
+     * in `scripts/pg-fixtures.sql`: a set-returning function materialises, so there
+     * would be nothing in flight to cancel.
+     *
+     * Needs a reload: the connection is saved through the bridge, but the renderer's
+     * connection store loaded its list at mount and cannot see it otherwise. Saving
+     * through the editor form instead would mean driving six more inputs to prove
+     * nothing new.
+     */
+    const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const uiCancel = liveConfigured
+      ? await (async (): Promise<Record<string, unknown>> => {
+          await win.webContents.executeJavaScript(`(async () => {
+      const db = window.tabby.db;
+      await db.saveConnection({
+        connection: {
+          id: 'smoke-ui',
+          name: 'smoke ui',
+          host: ${JSON.stringify(process.env['TABBY_TEST_PG_HOST'] ?? 'localhost')},
+          port: ${JSON.stringify(Number(process.env['TABBY_TEST_PG_PORT'] ?? 5432))},
+          database: ${JSON.stringify(pgDatabase)},
+          user: ${JSON.stringify(pgUser)},
+          sslMode: 'disable',
+          createdAt: 0,
+          updatedAt: 0,
+        },
+        password: ${JSON.stringify(process.env['TABBY_TEST_PG_PASSWORD'] ?? '')},
+      });
+    })()`);
+
+          const reloaded = new Promise<void>((resolve) => {
+            win.webContents.once('did-finish-load', () => resolve());
+          });
+          win.webContents.reload();
+          await reloaded;
+          await wait(1_500);
+
+          return (await win.webContents.executeJavaScript(`(async () => {
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const out = { ran: false, error: null };
+      const byText = (label) =>
+        Array.from(document.querySelectorAll('button')).find((b) => b.textContent.trim() === label);
+
+      const select = document.querySelector('select');
+      if (!select) { out.error = 'no connection picker after reload'; return out; }
+      select.value = 'smoke-ui';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(100);
+
+      const open = byText('Open');
+      if (!open) { out.error = 'no Open button'; return out; }
+      open.click();
+      await sleep(1500);
+
+      const pane = document.querySelector('[data-query-editor]');
+      const area = document.querySelector('[data-sql-input]');
+      if (!pane || !area) { out.error = 'no editor'; return out; }
+
+      area.value = 'select pg_sleep(60)';
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(150);
+
+      const run = pane.querySelector('[data-run]');
+      if (run.disabled) { out.error = 'Run stayed disabled with a connection open'; return out; }
+      run.click();
+      out.ran = true;
+
+      // Long enough to be on the server, short enough to stay well inside the 30s
+      // statement_timeout — the cancel has to be what stops it.
+      await sleep(1200);
+      const cancel = pane.querySelector('[data-cancel]');
+      out.cancelLiveWhileRunning = !cancel.disabled;
+      out.cancelNamesTheQuery = /pg_sleep/.test(cancel.textContent || '');
+      cancel.click();
+
+      const deadline = Date.now() + 15000;
+      let banner = '';
+      while (Date.now() < deadline) {
+        const element = document.querySelector('[data-run-error]');
+        if (element) { banner = element.textContent || ''; break; }
+        await sleep(100);
+      }
+      out.banner = banner.trim().slice(0, 140);
+      out.cancelled = banner.includes('QUERY_CANCELLED');
+      out.cancelInertAfterwards = pane.querySelector('[data-cancel]').disabled;
+      // No result tab may have opened for a query that never returned a row.
+      out.resultTabs = document.querySelectorAll('[role="tab"]').length;
+
+      const db = window.tabby.db;
+      await db.closeConnection('smoke-ui');
+      await db.deleteConnection('smoke-ui');
+      return out;
+    })()`)) as Record<string, unknown>;
+        })()
+      : null;
 
     const live = liveConfigured
       ? ((await win.webContents.executeJavaScript(`(async () => {
@@ -707,6 +913,57 @@ app
         tree['detailPresent'] === true && tree['detailInvites'] === true,
       ],
 
+      // ── Query editor: highlight layer and lexer-aware splitting ─────────────
+      ['the query editor is present', editor['present'] === true],
+      [
+        'the highlight layer, gutter and current-line rule all render',
+        editor['hasHighlightLayer'] === true &&
+          editor['hasGutter'] === true &&
+          editor['hasCurrentLine'] === true,
+      ],
+      // The property the whole stacked-textarea design rests on.
+      [
+        'the highlighted text is character-identical to the source',
+        editor['textMatchesSource'] === true,
+      ],
+      ['tokens are coloured', Number(editor['spanCount']) > 0],
+      [
+        'keywords and strings get distinct classes',
+        editor['hasKeywordSpan'] === true && editor['hasStringSpan'] === true,
+      ],
+      ['a semicolon in a line comment does not split', editor['commentDoesNotSplit'] === true],
+      ['a semicolon in a $$ body does not split', editor['dollarDoesNotSplit'] === true],
+      [
+        'a semicolon in an E-string with an escaped quote does not split',
+        editor['escapeStringDoesNotSplit'] === true,
+      ],
+      ['a real separator does split', editor['realSeparatorSplits'] === true],
+      [
+        // Chromium normalizes a bare CR in parsed HTML away and happy-dom does not,
+        // so only this harness can prove the `&#13;` escaping is doing its job. A
+        // mismatch here means a Windows-line-ending paste misaligns every line.
+        'a CRLF script keeps the two layers character-identical',
+        editor['crlfTextMatches'] === true &&
+          editor['crlfRenderedLength'] === editor['crlfSourceLength'],
+      ],
+      ['HTML in a query creates no element', Number(editor['injectedElements']) === 0],
+      ['HTML in a query is escaped, not parsed', editor['escapedAngle'] === true],
+      [
+        'an unterminated literal is reported and still highlighted',
+        editor['unterminatedReported'] === true && editor['unterminatedStillHighlighted'] === true,
+      ],
+      [
+        'run, run-all, explain and cancel are all wired',
+        editor['runPresent'] === true &&
+          editor['runAllPresent'] === true &&
+          editor['explainPresent'] === true &&
+          editor['cancelPresent'] === true,
+      ],
+      [
+        'run and cancel are disabled with no connection open',
+        editor['runDisabled'] === true && editor['cancelDisabled'] === true,
+      ],
+
       // ── IPC contract ───────────────────────────────────────────────────────
       ['bridge exposes the db API', ipc.hasDb === true],
       ['bridge exposes event subscriptions', ipc.hasEvents === true],
@@ -865,6 +1122,34 @@ app
             ],
           ] as [string, boolean][])),
 
+      // ── Cancelling a runaway query from the UI (Phase 7 exit criterion) ──────
+      ...(uiCancel === null
+        ? []
+        : ([
+            [
+              `ui: the cancel run reached the server${uiCancel['error'] ? ` (${String(uiCancel['error'])})` : ''}`,
+              uiCancel['ran'] === true,
+            ],
+            [
+              'ui: Cancel becomes live while a query is on the server',
+              uiCancel['cancelLiveWhileRunning'] === true,
+            ],
+            [
+              'ui: Cancel names the query it is about to stop',
+              uiCancel['cancelNamesTheQuery'] === true,
+            ],
+            [
+              'ui: cancelling a runaway query surfaces QUERY_CANCELLED',
+              uiCancel['cancelled'] === true,
+            ],
+            ['ui: Cancel is inert again afterwards', uiCancel['cancelInertAfterwards'] === true],
+            // The demo tab is seeded on mount; a cancelled run must not add one.
+            [
+              'ui: no result tab opened for a query that never returned a row',
+              Number(uiCancel['resultTabs']) <= 1,
+            ],
+          ] as [string, boolean][])),
+
       ['no unexpected console errors', problems.length === 0],
     ];
 
@@ -878,6 +1163,8 @@ app
           report,
           interaction,
           tree,
+          editor,
+          uiCancel,
           clipboard: {
             payloadLines: payloadLines.length,
             payloadFields,

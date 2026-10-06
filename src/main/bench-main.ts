@@ -243,7 +243,15 @@ app
       };
       settingsDir = mkdtempSync(join(tmpdir(), 'tabby-bench-'));
       const settings = new SettingsStore({ dir: settingsDir, cipher });
-      services = createDbServices({ settings, emit: () => undefined });
+      services = createDbServices({
+        settings,
+        // Same wiring as `src/main/index.ts`. Without it the renderer never sees a
+        // progress event, so the exact row count never replaces the `reltuples`
+        // estimate and the benchmark would be measuring a scrollbar that lies.
+        emit: (channel, payload) => {
+          if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+        },
+      });
       disposeIpc = registerIpcHandlers({
         settings,
         window: () => win,
@@ -309,23 +317,48 @@ app
     mark(`renderer loaded (liveMode=${String(liveMode)})`);
 
     /**
-     * Drives the real UI: pick the connection, open it, browse the table.
+     * Drives the real UI: pick the connection, open it, then browse the table
+     * through the schema tree.
      *
      * Deliberately DOM-level rather than a test hook in the app — a `?bench=live`
      * branch in App.vue would mean the benchmark measures code the shipped app does
      * not run. Vue's v-model listens for `input` and the select for `change`, so
      * dispatching those is enough.
+     *
+     * Phase 7 removed the "browse a table" text box the harness used to type into;
+     * the tree is now the way in. That is a better harness, not a worse one — it
+     * drives the two gestures a user actually makes (expand a schema, double-click a
+     * relation) and it exercises the same browse path, so the grid measurement still
+     * covers keyset paging with no transaction held open.
      */
     let liveOpened = false;
     let activeTab = '';
     let treeResult: TreeBench | null = null;
     if (liveMode) {
+      const dot = BENCH_TABLE.indexOf('.');
+      const benchSchema = dot < 0 ? 'public' : BENCH_TABLE.slice(0, dot);
+      const benchRelation = dot < 0 ? BENCH_TABLE : BENCH_TABLE.slice(dot + 1);
+
       liveOpened = (await benchWindow.webContents.executeJavaScript(`(async () => {
       const nap = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
       const byText = (label) =>
         Array.from(document.querySelectorAll('button')).find(
           (b) => b.textContent.trim() === label,
         );
+      const rowFor = (label) =>
+        Array.from(document.querySelectorAll('[role="treeitem"]')).find(
+          (element) => element.getAttribute('data-node-label') === label,
+        );
+      /** Polls rather than sleeping a fixed guess: the catalog read is I/O. */
+      const waitFor = async (find, timeoutMs) => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const found = find();
+          if (found) return found;
+          if (Date.now() > deadline) return null;
+          await nap(50);
+        }
+      };
 
       const select = document.querySelector('select');
       if (!select) return false;
@@ -336,15 +369,14 @@ app
       const open = byText('Open');
       if (!open) return false;
       open.click();
-      await nap(2500);
 
-      const table = document.querySelector('[data-browse-input]');
-      const browse = byText('Open table');
-      if (!table || !browse) return false;
-      table.value = ${JSON.stringify(BENCH_TABLE)};
-      table.dispatchEvent(new Event('input', { bubbles: true }));
-      await nap(100);
-      browse.click();
+      const schemaRow = await waitFor(() => rowFor(${JSON.stringify(benchSchema)}), 15000);
+      if (!schemaRow) return false;
+      schemaRow.querySelector('.caret').click();
+
+      const tableRow = await waitFor(() => rowFor(${JSON.stringify(benchRelation)}), 15000);
+      if (!tableRow) return false;
+      tableRow.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
       return true;
     })()`)) as boolean;
 
