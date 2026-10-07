@@ -56,16 +56,24 @@ const db: DatabaseApi = {
 
   queryRun: (req) => invoke(IpcChannel.queryRun, req),
   queryCancel: (resultId) => invoke(IpcChannel.queryCancel, resultId),
+  historyList: (limit) => invoke(IpcChannel.historyList, limit),
+  historyAdd: (req) => invoke(IpcChannel.historyAdd, req),
+  historyDelete: (historyId) => invoke(IpcChannel.historyDelete, historyId),
+  historyClear: () => invoke(IpcChannel.historyClear),
   resultMeta: (resultId) => invoke(IpcChannel.resultMeta, resultId),
   resultWindow: (req) => invoke(IpcChannel.resultWindow, req),
   resultSort: (req) => invoke(IpcChannel.resultSort, req),
   resultDispose: (resultId) => invoke(IpcChannel.resultDispose, resultId),
+
+  exportStart: (req) => invoke(IpcChannel.exportStart, req),
+  exportCancel: (exportId) => invoke(IpcChannel.exportCancel, exportId),
 };
 
 const events: TabbyEvents = {
   onQueryProgress: (listener) => subscribe(IpcChannel.evQueryProgress, listener),
   onConnectionLost: (listener) => subscribe(IpcChannel.evConnectionLost, listener),
   onResultEvicted: (listener) => subscribe(IpcChannel.evResultEvicted, listener),
+  onExportProgress: (listener) => subscribe(IpcChannel.evExportProgress, listener),
 };
 
 const api: TabbyApi = {

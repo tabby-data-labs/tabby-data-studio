@@ -525,6 +525,110 @@ being acquired, there is no backend to signal. That returns
 `NOT_FOUND: the query has not reached the server yet` rather than reporting success for a cancel that
 could not have reached anything.
 
+### 5.11 A checked-out client needs its own `error` listener (Phase 8)
+
+`pg`'s `Pool` emits `'error'` for **idle** clients only, and `createPgDriver` has always handled that.
+A client handed out by `acquire()` is no longer idle, so its errors go to the client's own
+`EventEmitter` — and an `'error'` event with no listener is rethrown by Node as an uncaught exception,
+which takes the whole main process down.
+
+The trigger is not exotic. A result tab holds a `REPEATABLE READ` transaction open for as long as the
+user leaves it on screen, and `idle_in_transaction_session_timeout` is 60s (§5.1). Leave a query result
+sitting for a minute and the server terminates the backend: an ordinary, documented event that was
+fatal. `acquire()` now attaches a listener that records the failure — so subsequent `query()` calls
+reject immediately instead of queueing onto a socket the server has already closed — and returns the
+pool slot, because holding a client for a dead backend would leak one of the four.
+
+Found by the smoke harness, and only after the harness was taught to print a crash instead of hanging:
+before that, an unhandled rejection inside `app.whenReady().then(…)` left Electron running with no
+window logic left to exit, and ten minutes of wall clock produced **no output at all**.
+
+### 5.12 Streamed export: rows never cross the bridge (Phase 8)
+
+PLAN's exit criterion is a memory budget on the _renderer_, and the design meets it structurally
+rather than by tuning. `ExportService` reads a batch from **its own** cursor, serialises it, writes it
+to a `WriteStream`, and drops it. The renderer's entire view of an export is
+`{rowsWritten, bytesWritten, phase}` on `event:export-progress`. Measured: 1M rows → 33.4MB in 12.2s
+with **−0.5MB** retained in main, and a 200k-row export through the real UI moving the renderer heap
+by **0MB**.
+
+Four rules follow from that, and each is load-bearing:
+
+- **Its own client and cursor.** `QueryService.exportDescription(resultId)` returns the connection, the
+  full statement and the columns — a _description_, never the live cursor. Exporting through the
+  result's own cursor would advance a `NO SCROLL` cursor the grid is paging with and leave the tab
+  showing rows it no longer has. The cost is a second pooled slot and a second snapshot, so a file
+  exported while the table is being written can differ from what was on screen. A live test asserts the
+  grid's cursor still works — including a backward jump — after its result has been exported.
+- **For a browse result the exported statement is `baseSql`, not `sql`.** `state.sql` for an unpaged
+  browse is the _keyset page_, carrying its `LIMIT`; exporting that would write `initialRows` rows and
+  call it the table. Once the user sorts, the result becomes a cursor and `state.sql` is already the
+  full sorted query, so the branch is exactly "is this still an unpaged browse".
+- **Backpressure is honoured.** `write()` awaits `'drain'` when `writableNeedDrain` says so. Ignoring it
+  would let a slow disk become an unbounded Node write buffer — which is how a "streaming" export ends
+  up holding the whole result in memory anyway, and would pass every row-count assertion.
+- **A failure deletes the partial file; a cancel keeps it.** A truncated CSV that looks complete is a
+  trap: a spreadsheet opens it and reports fewer rows than the query returned, with nothing to say why.
+  A cancelled export is the user's own decision to stop, and discarding the rows they did get would be
+  the surprising choice. The file is only deleted when the service actually created it, so failing
+  _before_ the stream opens cannot remove something the user named in the dialog.
+
+### 5.13 The destination is main's decision, and only main's
+
+`ExportStartRequest` has **no path field**, and `exactKeys` in `validate.ts` is what enforces it. The
+destination comes from `dialog.showSaveDialog`, so the only way bytes reach the disk is through a
+picker the user just confirmed. Accepting a path from the renderer would let a compromised one write
+anywhere the user's account can — a strictly worse posture than the one `safeStorage` gives passwords.
+
+The smoke harness asserts this end to end: it calls `exportStart` with a smuggled
+`path: '/tmp/tabby-smuggled.csv'`, and checks both that the call is refused `VALIDATION_FAILED` and
+that **no file appears there**. `save-dialog.ts` is injected into `ExportService` as `pickPath`, which
+is what keeps the service testable without Electron and lets both harnesses write into a throwaway
+directory and read the bytes back.
+
+`createDbServices` takes `pickPath` as a **required** dependency. A silent default — a stub returning
+null, or one writing somewhere convenient — would quietly change what the app is allowed to touch;
+making it required means every entry point has to decide, and the compiler lists the ones that have not.
+
+### 5.14 Query history retention (Phase 7)
+
+JSONL in `userData/history/`, rotated at 1 MiB into numbered siblings, of which at most three are
+kept. PLAN's privacy note is why the bounds are **constants rather than settings**: history may contain
+literals that are secrets, and a user-configurable "keep forever" turns a bounded local file into an
+unbounded record of everything anyone ever typed. `clear` and `delete` unlink; that removes the files
+from the filesystem, not from the disk platter or an SSD's wear-levelling table — the same guarantee a
+browser gives, and the one the note claims.
+
+Three rules the format depends on:
+
+- `rotationSteps` returns its renames **oldest slot first**. The opposite order renames `history.1` onto
+  `history.2` before deleting the old `history.2`, destroying a file the caller has not read.
+- `truncateSql` counts **code points**, not UTF-16 units. A naive `slice` can end on a lone surrogate:
+  valid JSON, unrenderable text, and a preview that looks like corruption for good SQL.
+- Nothing throws. `decodeLine` returns `null` for a line it cannot read and `parseHistory` counts those
+  in `skipped`, mirroring `SettingsStore`'s stance on `settings.json` — losing every remembered query
+  over one truncated write is the worse outcome.
+
+Writing history is a **side effect of a run that already happened**, so `HistoryStore.add` returns a
+tagged error and never throws: a full disk must not turn a successful `SELECT` into a failed one. The
+warning reaches the user on `historyList`, which is the only channel it has.
+
+### 5.15 What cannot cross the Electron bridge (Phase 8)
+
+`contextBridge` uses structured clone, and two things in this codebase do not survive it:
+
+- **Typed arrays survive, but only if nothing flattens them first.** The columnar codec depends on this
+  and Phase 5 verified it against real Electron rather than Node's `structuredClone`.
+- **A Vue reactive Proxy does not survive.** The export dialog holds its options in a `ref`, so
+  `options.value` is a Proxy; structured clone rejects it with "An object could not be cloned". Because
+  `data/ipc.ts` turns any rejection into a tagged `Result`, this surfaced as `NOT_CONNECTED` — which
+  reads as "main has no handler for this channel", an entirely different bug from the real one.
+  `stores/exports.ts` copies the options **field by field** before sending. A spread would work today
+  and would silently forward a nested proxy the day an option gained one.
+
+No unit test can catch the second class, because a stubbed bridge accepts anything. The regression test
+asserts `isReactive(sent.options) === false` explicitly, and the smoke harness is what found it.
+
 ---
 
 ## 6. Designed-in for v2 editing (declarations only — nothing implemented)

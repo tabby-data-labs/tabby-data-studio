@@ -1,11 +1,14 @@
 import { app, BrowserWindow } from 'electron';
+import { join } from 'node:path';
 import { createMainWindow } from './window/create-window';
 import { trackWindowState } from './window/window-state';
 import { applySecurityGuards } from './security/navigation';
 import { registerIpcHandlers } from './ipc/router';
 import { SettingsStore } from './store/settings-store';
+import { HistoryStore } from './store/history-store';
 import { safeStorageCipher } from './store/cipher';
 import { createDbServices, type DbServices } from './db/services';
+import { createSavePathPicker } from './export/save-dialog';
 import { logError, logInfo, logWarn } from './log';
 
 let mainWindow: BrowserWindow | null = null;
@@ -17,7 +20,10 @@ let db: DbServices | null = null;
 const SHUTDOWN_GRACE_MS = 2_000;
 
 function openWindow(settings: SettingsStore): void {
-  mainWindow = createMainWindow({ state: settings.current.window });
+  mainWindow = createMainWindow({
+    state: settings.current.window,
+    theme: settings.current.theme,
+  });
   disposeWindowTracking = trackWindowState(mainWindow, settings);
 
   mainWindow.on('closed', () => {
@@ -36,6 +42,12 @@ app.whenReady().then(() => {
     cipher: safeStorageCipher,
   });
 
+  // Its own subdirectory rather than siblings of settings.json, so "clear history"
+  // has an obvious scope on disk and a future export or cache file cannot be
+  // mistaken for a rotation. Nothing is read at construction, so there is no
+  // load warning to report here — a failed write surfaces on the next `list`.
+  const history = new HistoryStore({ dir: join(app.getPath('userData'), 'history') });
+
   if (settings.loadWarning) {
     // Surfaced, not swallowed: silently resetting someone's saved connections
     // would be far worse than telling them it happened.
@@ -50,6 +62,7 @@ app.whenReady().then(() => {
 
   db = createDbServices({
     settings,
+    pickPath: createSavePathPicker(() => mainWindow),
     emit: (channel, payload) => {
       const win = mainWindow;
       if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
@@ -62,6 +75,8 @@ app.whenReady().then(() => {
     connections: db.connections,
     schemas: db.schemas,
     queries: db.queries,
+    history,
+    exports: db.exports,
   });
   logInfo('main', `IPC registered; userData=${app.getPath('userData')}`);
 

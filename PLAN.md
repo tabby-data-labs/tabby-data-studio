@@ -669,19 +669,30 @@ has no resize handle, so the 288px sidebar is fixed. Typeahead (jump-to on chara
 keys) is not implemented. DDL for sequences is deliberately absent rather than
 approximate.
 
-### Phase 7 — Query console · ◄── IN PROGRESS (2026-10-06) · both exit criteria met
+### Phase 7 — Query console · ◄── EXIT CRITERIA MET (2026-10-07) · one deliverable deferred
 
-> **Both exit criteria pass; two deliverables do not exist yet.** Marked in progress
-> rather than complete because query history and the `EXPLAIN` plan tree are listed
-> below and are not built. Everything else is done and verified.
+> **Both exit criteria pass, and query history was finished on 2026-10-07.** One
+> listed deliverable is still not built: the rendered `EXPLAIN` plan tree. It is
+> deferred rather than quietly dropped — see the note under it. Everything else is
+> done and verified.
 
 - ✅ Editor: `<textarea>` overlay + a highlighted `<pre>` behind it, scroll-synced, with line numbers and current-line highlight
 - ✅ Hand-written Postgres lexer: keywords, identifiers, `"quoted idents"`, `'strings'` with `''` escapes, `$$dollar quoting$$`, `E''` escapes, numbers, operators, `--` and `/* */` comments
 - ✅ **Lexer-aware statement splitter** — never splits on `;` naively; `;` inside a string, comment, or dollar-quoted body does not split
 - ✅ Cmd/Ctrl+Enter runs; one result tab per statement; per-statement timing in the tab title, row count in the status line
 - ✅ Cancel button wired to `pg_cancel_backend`, including for a run that has not registered yet
-- ❌ Query history (JSONL, rotated). **Privacy note:** history may contain literals including secrets — store locally, never sync, and offer a clear-history action. _Not built, so the privacy requirement is not yet in force._
-- ⚠️ `EXPLAIN` / `EXPLAIN ANALYZE` rendered as a plan tree. _Explain runs `explain (format text)` into the grid — complete information, but not a rendered tree. `EXPLAIN ANALYZE` is not wired._
+- ✅ **Query history (JSONL, rotated), delivered 2026-10-07.** The privacy note is now
+  in force and is implemented, not just written down: the log lives in
+  `userData/history/`, is bounded to **3 files × 1 MiB** by constants rather than
+  settings, never leaves the machine, is deletable one entry at a time, and the panel
+  renders the note _where the secrets are listed_ rather than leaving it in this file.
+- ⚠️ `EXPLAIN` / `EXPLAIN ANALYZE` rendered as a plan tree. _Explain runs
+  `explain (format text)` into the grid — complete information, exactly what `psql`
+  prints, selectable and copyable, but not a rendered tree. `EXPLAIN ANALYZE` is not
+  wired. **Deferred, not forgotten:** the text form loses no information, so this is
+  presentation; a plan tree wants `format json`, a pure `planTree()` module and its own
+  tab kind, which is a phase of work rather than a leftover. It should not be started
+  as an aside._
 
 | Exit criterion                                                                                     | Result                                                                                                                                                                                                                 |
 | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -708,11 +719,29 @@ Delivered:
   than cascading.
 - `QueryService.pendingRuns`, so a run can be cancelled before it registers.
 
+Added when query history landed (2026-10-07):
+
+- `src/shared/history.ts` — the JSONL wire format and the retention rules. `encodeEntry`
+  / `decodeLine` / `parseHistory` never throw; a corrupt line costs that line and is
+  counted in `skipped` rather than losing the log. `truncateSql` counts **code points**,
+  so a truncation cannot end on a lone surrogate. `rotationSteps` returns its renames
+  **oldest slot first**, because the opposite order destroys a file that has not moved yet.
+- `src/main/store/history-store.ts` — append, rotate, list, delete one, clear. A write
+  failure returns a tagged error and **never fails the query it describes**: the
+  statement already ran, and a full disk is not allowed to rewrite that outcome.
+- `stores/history.ts` + `HistoryPanel.vue`. The list is updated **in place** rather than
+  re-read, so a Run click does not cost a parse of up to 3 MiB.
+- Every run is one record; repeats are **not** collapsed. That is what psql, DBeaver and
+  DataGrip do, and the fourth attempt that finally succeeded is a different event from the
+  three that failed. An earlier draft of this phase had a `mergeRepeat` policy; it was
+  removed before shipping as a surprise the user did not ask for.
+
 **Gate:** `deps:check` ✅ · `lint` ✅ 0/0 · `typecheck` ✅ node+web · `npm test` ✅
-**1,252 passed**, 44 files · `test:pg` ✅ **57 passed** · `build` ✅ · `smoke` ✅
-**83/83** · `smoke:dev` ✅ **83/83** · `smoke` + DB ✅ **114/114** · `bench` ✅ ·
+**1,746 passed**, 57 files · `test:pg` ✅ **64 passed** · `build` ✅ · `smoke` ✅
+**108/108** · `smoke:dev` ✅ **108/108** · `smoke` + DB ✅ **149/149** · `bench` ✅ ·
 grid unchanged: `git diff --stat HEAD -- src/renderer/src/grid tests/unit/grid-*.spec.ts`
-is **empty**.
+is **empty**. _(Numbers are after Phase 8; the history work alone took the suite from
+1,252 to 1,416 and smoke from 83 to 98.)_
 
 Live benchmarks, driven through the schema tree, 600 frames each:
 
@@ -760,17 +789,163 @@ computes `sustainedFps` but never gates on it: a run contaminated by a concurren
 A conservative fps floor belongs in the grid bench too, but that changes a Phase 1 perf
 contract and is a decision to make deliberately, not in passing.
 
-### Phase 8 — Export & polish · 5 days · ◄── NEXT
+### Phase 8 — Export & polish · ✅ COMPLETE (2026-10-07)
 
-- Streamed export to CSV / JSON / SQL `INSERT` / TSV, writing directly to disk from main (never through the renderer), with progress and cancel
-- RFC 4180-correct CSV quoting; configurable delimiter, encoding, NULL representation, header row
-- Command palette (fuzzy, hand-written)
-- Dark/light theme via Tailwind v4 `@theme` tokens + CSS variables
-- i18n hooks (string extraction, no runtime framework yet)
+- ✅ Streamed export to CSV / JSON / SQL `INSERT` / TSV, writing directly to disk from main (**never through the renderer**), with progress and cancel
+- ✅ RFC 4180-correct CSV quoting; configurable delimiter, encoding, NULL representation, header row, line ending and byte-order mark
+- ✅ Command palette (fuzzy, hand-written — a DP alignment, not a regex)
+- ✅ Dark/light theme via Tailwind v4 `@theme` tokens + CSS variables
+- ✅ i18n hooks (typed catalogue, single-pass interpolation, extraction/consistency script)
 
-**Exit criteria:** exporting 1M rows to CSV completes without exceeding ~150MB of renderer memory and can be cancelled mid-flight.
+| Exit criterion                                                                 | Result                                                                                                                                                                                                                                                                                                     |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exporting 1M rows to CSV completes without exceeding ~150MB of renderer memory | **Yes, and the renderer holds nothing at all.** Live: 1,000,000 rows → 33,452,928 bytes in **12.2s** (81,847 rows/s) with **−0.5MB** retained in main after a full GC. Through the real UI: 200,000 rows, `performance.memory` delta **0MB** (21MB before, 21MB after). Structural, not tuned — see below. |
+| It can be cancelled mid-flight                                                 | **Yes, twice.** Live on the full 10M-row table: cancel lands in **125ms**, the partial file survives and holds _exactly_ the rows the terminal event claims. Through the UI: a 3M-row export cancelled after one batch, tray reports `cancelled`, 5,001 records kept.                                      |
 
-### Phase 9 — Packaging & release · 3–5 days
+**Why the renderer number is structural rather than measured-and-tuned.** Rows go
+cursor → serialiser → `WriteStream` and never cross the bridge. `ExportStartRequest`
+carries a result id and options; the response is an id, a path and three numbers; the
+only thing that flows back during the export is `{rowsWritten, bytesWritten, phase}`.
+There is no code path by which a row could reach the renderer, so the 150MB budget is not
+a threshold this implementation happens to sit under — it is unreachable.
+
+**The metric had to change to see that.** The first version of the live test asserted on
+_peak_ `heapUsed` during the export and reported **435MB**, well over budget, for an
+export that holds one 5,000-row batch. `heapUsed` without a collection is V8's
+_uncollected garbage_, and a serialiser that allocates a string per row produces a great
+deal of it. Peak-during measures the allocator's laziness; **retained-after-GC** measures
+whether anything was buffered, which is the question being asked. The assertion now forces
+a collection and the number is −0.5MB. `npm run test:pg` supplies `--expose-gc`, and the
+spec **throws** rather than silently falling back if it is missing — a bound asserted
+against uncollected garbage is a measurement of nothing.
+
+Delivered:
+
+- `src/shared/export.ts` — formats, encodings, and per-format defaults. csv defaults to
+  **CRLF** because RFC 4180 §2.1 defines a record that way; the others to LF. The
+  retention-style bounds (`HISTORY_LIMITS`'s counterpart) are constants, not settings.
+- `src/main/export/serialise.ts` — `createSerialiser` returning `begin()` / `row()` /
+  `end()`, so the service holds one row of state at a time. Values go through
+  `normalizeValue`, **the same function the grid and the clipboard use**: `int8` and
+  `numeric` exceed 2^53, and a second conversion path would be a second chance to round
+  them. 85 Tier 1 cases written first.
+- `src/main/export/export-service.ts` — its own pooled client, its own `NO SCROLL` cursor
+  in `REPEATABLE READ`, 5,000-row batches, backpressure honoured via
+  `writableNeedDrain`, progress events, cancel by flag **and** `pg_cancel_backend`.
+- `src/main/export/save-dialog.ts` — the only route by which a path enters the service.
+- `src/renderer/src/palette/fuzzy.ts` — subsequence matching scored by a DP over
+  (query character, text code point) carrying contiguity. Not a greedy scan: greedy
+  reports `ab` in `aabb` at `[0, 2]`, breaking a run the text plainly contains, which
+  would both underline the wrong letters and rank the item too low. **No `RegExp` is ever
+  built from the query** — it is untrusted keystroke-by-keystroke input.
+- `src/renderer/src/palette/segments.ts` — matched runs for the highlight, walking by code
+  point so an astral character stays in one segment instead of becoming two replacement
+  boxes in the DOM.
+- `CommandPalette.vue`, `ExportDialog.vue`, `stores/exports.ts`, `stores/ui.ts`.
+- `src/renderer/src/i18n/` + `scripts/check-i18n.mjs` (`npm run i18n:check`): 47 catalogue
+  keys, **63 `t()` call sites**, no missing keys.
+
+**Five findings**
+
+1. **A checked-out `pg` client with no `'error'` listener kills the whole app.** The pool
+   has an `'error'` handler, but `pg` emits that only for **idle** clients. A result tab
+   holds a `REPEATABLE READ` transaction open, `idle_in_transaction_session_timeout` is
+   60s, so leaving a query result on screen for a minute makes the server terminate the
+   backend — and the resulting `'error'` on a live client was an unhandled EventEmitter
+   error, which Node rethrows as an uncaught exception. **An ordinary, documented event
+   was fatal.** Fixed in `driver-pg.ts`: the client gets a listener, records the failure so
+   later queries reject fast instead of queueing onto a dead socket, and returns its pool
+   slot rather than leaking one of the four. Found only because the smoke harness was first
+   taught to print a crash instead of hanging — before that it produced _no output at all_
+   for ten minutes, and a harness whose job is to report was silent.
+2. **A Vue reactive Proxy cannot cross the Electron bridge.** The export dialog keeps its
+   options in a `ref`, so what reaches `exportStart` is a Proxy, and structured clone
+   rejects it with "An object could not be cloned". The bridge helper turns any rejection
+   into a tagged error, so this surfaced as `NOT_CONNECTED` — which reads as "main has no
+   handler for this channel", a completely different bug from the real one. Fixed by
+   copying the options field by field in `stores/exports.ts`; a spread would work today and
+   forward a nested proxy the day one appears. **No unit test could catch this**, because a
+   stubbed bridge accepts anything. The regression test asserts `isReactive(sent) === false`
+   explicitly, and the smoke harness is what actually found it.
+3. **`dropConnection` drained every export, not just its own.** Closing connection B waited
+   out an unrelated export on connection A. Caught by a unit test that asserted the count
+   _after_ dropping a connection with nothing on it.
+4. **Two integration files cannot run concurrently.** Both harnesses connect as
+   `application_name = 'tabby'`, and `pg-data-layer.spec.ts` asserts on a **server-global**
+   count of such backends sitting idle in transaction. A million-row export holds one open
+   for twelve seconds, and four correct assertions in the other file failed. Each file
+   passes alone. `test:pg` now passes `--no-file-parallelism`, and the constraint is written
+   into the spec rather than left as tribal knowledge.
+5. **A CSV default that only shows up on someone else's machine.** csv writes a
+   byte-order mark by default because Excel infers the encoding of a BOM-less file from the
+   _locale_ and will mangle every non-ASCII cell — silently, and only for some users. The
+   `.tok-*` syntax colours had to move out of `QueryEditor.vue` into `main.css` for the same
+   class of reason: Tailwind only emits an `@theme` variable that something references, and
+   a reference inside an SFC's `<style>` block is not one it can see.
+
+**Deliberate limits, stated rather than hidden.**
+
+- An export opens a **second** cursor and therefore a second snapshot. Sharing the result's
+  cursor would advance a `NO SCROLL` cursor the grid is paging with and leave the tab
+  showing rows it no longer has. A live integration test asserts the grid's cursor still
+  works — including a backward jump — after its result has been exported.
+- A **failure deletes** the partial file, a **cancel keeps** it. A truncated CSV that looks
+  complete is a trap; a cancelled export is the user's own decision to stop. The file is
+  only deleted if the service actually created it, so failing before the stream opens
+  cannot remove something the user named in the dialog.
+- Exports are capped at **2 concurrent** and refuse beyond that with `EXPORT_BUSY` rather
+  than queueing inside `acquire()`, which the user would see as a progress bar that never
+  moves and nothing explaining why.
+- `int8` and `numeric` leave JSON as **strings**, because a JSON number cannot hold them.
+  A reader that wants a number can parse one; a reader handed a rounded number has no way
+  to know.
+- The `sql` serialiser duplicates about twenty lines of RFC 4180 quoting that also exist in
+  `grid/clipboard.ts`. Sharing would mean either the grid importing from main, which the
+  ESLint boundary forbids, or moving the serialiser into `shared` and editing grid files —
+  which would break the "the grid did not change" property Phases 5, 6 and 7 all prove with
+  an empty `git diff`. The inputs differ too: the clipboard serialises decoded display
+  strings for a bounded selection, this serialises raw server values for an unbounded one.
+- **i18n is a hook, not a migration.** 63 call sites, all of them in the Phase 7–8 UI
+  (history panel, export dialog, palette, export tray). The Phase 0–6 components still
+  carry inline English; `npm run i18n:check` reports unused catalogue keys as a warning for
+  exactly that reason, and `tPlural`'s two keys always read as unused because its key is
+  built by suffix at runtime.
+- `latin1` is offered because legacy spreadsheet workflows ask for it, and it is **lossy**
+  above U+00FF. The dialog says so when it is selected rather than letting the user find
+  the `?` characters in the file.
+
+**Gate:** `deps:check` ✅ runtime budget = `pg` only · `lint` ✅ 0 errors 0 warnings ·
+`typecheck` ✅ node + web · `npm test` ✅ **1,746 passed**, 57 files (+64 integration
+skipped without a database) · `test:pg` ✅ **64 passed** against PostgreSQL 18.6 ·
+`i18n:check` ✅ 47 keys, 63 call sites, no missing keys · `build` ✅ · `smoke` ✅
+**108/108** · `smoke:dev` ✅ **108/108** · `smoke` + DB ✅ **149/149** · `bench` ✅
+`failures: []` · grid unchanged: **empty diff**, for the fourth phase running.
+
+Live benchmarks, 600 frames each, machine otherwise idle:
+
+| Source                                        | p50 | p95        | fps   | dropped |
+| --------------------------------------------- | --- | ---------- | ----- | ------- |
+| live grid, 10M×4 (browse)                     | —   | **3.30ms** | 59.90 | —       |
+| schema tree, 2,025 rows → **26 DOM elements** | —   | **1.90ms** | 59.88 | 0       |
+
+Live export measurements (`TABBY_REPORT_PERF=1 npm run test:pg`):
+
+| Measurement                                         | Result                                     |
+| --------------------------------------------------- | ------------------------------------------ |
+| 1,000,000 rows → CSV                                | **12.2s**, 33,452,928 bytes, 81,847 rows/s |
+| Main-process heap **retained** by that export       | **−0.5MB** (one batch, not the result)     |
+| Cancel an in-flight 10M-row export                  | **125ms**                                  |
+| Renderer heap delta, 200k-row export through the UI | **0MB** (21MB → 21MB)                      |
+
+**Not verified by a human:** whether the light theme is actually _pleasant_ — the smoke
+harness proves `getComputedStyle(document.body).backgroundColor` goes from `rgb(3, 11, 22)`
+to `rgb(255, 255, 255)` and back, which is a fact about the cascade and not about contrast
+ratios or legibility. No WCAG contrast audit has been run on either palette. No screen
+reader has been over the palette's `combobox`/`listbox` wiring or the export dialog. The
+save dialog itself has never been driven — no harness can click a native sheet, so
+`save-dialog.ts` is the one Phase 8 file with no test coverage beyond typechecking.
+
+### Phase 9 — Packaging & release · 3–5 days · ◄── NEXT
 
 - `electron-builder` config: macOS `dmg` + `zip`, `arm64` and `x64`; `asar: true`; **no `asarUnpack` needed** because there are no native modules
 - App icon, name, bundle id, category

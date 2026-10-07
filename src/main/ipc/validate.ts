@@ -18,12 +18,21 @@
 import type {
   BrowseTarget,
   ConnSaveRequest,
+  ExportStartRequest,
+  HistoryAddRequest,
   QueryRunRequest,
   ResultSortRequest,
   ResultWindowRequest,
   SchemaChildrenRequest,
   SchemaTableRequest,
 } from '../../shared/ipc-contract';
+import { HISTORY_LIMITS, type HistoryStatus } from '../../shared/history';
+import {
+  EXPORT_ENCODINGS,
+  EXPORT_FORMATS,
+  EXPORT_LINE_ENDINGS,
+  type ExportOptions,
+} from '../../shared/export';
 import type { SettingsPatch, SortSpec, WindowState } from '../../shared/domain';
 
 /** Raised for any rejected payload. `field` is a dotted path for logging and UI. */
@@ -56,6 +65,7 @@ export const MAX_WINDOW_POSITION = 1_000_000;
 const SSL_MODES = ['disable', 'prefer', 'require', 'verify-ca', 'verify-full'] as const;
 const THEMES = ['dark', 'light'] as const;
 const SORT_DIRECTIONS = ['asc', 'desc'] as const;
+const HISTORY_STATUSES: readonly HistoryStatus[] = ['ok', 'failed', 'cancelled'];
 
 const CONNECTION_FIELDS = [
   'id',
@@ -312,6 +322,135 @@ export function validateResultSort(value: unknown): ResultSortRequest {
     resultId: str(record['resultId'], 'resultId', { max: MAX_ID_LENGTH }),
     sort: sort === null ? null : sortSpec(sort, 'sort'),
   };
+}
+
+// ── Query history (Phase 7) ──────────────────────────────────────────────────
+
+/**
+ * One remembered run.
+ *
+ * `sql` goes through `sqlText`, so the NUL check applies here too: a NUL in a
+ * JSONL record would be a record boundary waiting to happen. The length cap is
+ * the shared IPC one, not the history one — truncating to the retention limit is
+ * the store's decision, and doing it here would hide from the caller that the
+ * statement it sent was larger than what gets kept.
+ */
+export function validateHistoryAdd(value: unknown): HistoryAddRequest {
+  const record = object(value, 'request');
+  exactKeys(
+    record,
+    ['sql', 'connectionId', 'connectionLabel', 'status', 'elapsedMs', 'rowCount'],
+    '',
+  );
+  return {
+    sql: sqlText(record['sql'], 'sql'),
+    connectionId: str(record['connectionId'], 'connectionId', { max: MAX_ID_LENGTH }),
+    connectionLabel: str(record['connectionLabel'], 'connectionLabel', {
+      max: MAX_NAME_LENGTH * 2,
+      allowEmpty: true,
+    }),
+    status: oneOf(record['status'], HISTORY_STATUSES, 'status'),
+    elapsedMs: finite(record['elapsedMs'], 'elapsedMs', -1, Number.MAX_SAFE_INTEGER),
+    rowCount: finite(record['rowCount'], 'rowCount', -1, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+/**
+ * The page size for `history:list`.
+ *
+ * Optional, because "the default" is a main-side retention decision the renderer
+ * should not have to know. Capped at the same constant, so a compromised renderer
+ * cannot ask for the whole log and hold it in one response.
+ */
+export function validateHistoryLimit(value: unknown): number {
+  if (value === undefined) return HISTORY_LIMITS.maxEntriesReturned;
+  return int(value, 'limit', 1, HISTORY_LIMITS.maxEntriesReturned);
+}
+
+export function validateHistoryId(value: unknown): string {
+  return str(value, 'historyId', { max: MAX_ID_LENGTH });
+}
+
+// ── Export (Phase 8) ─────────────────────────────────────────────────────────
+
+/** A separator that would break the record structure it is supposed to delimit. */
+const DELIMITER_FORBIDDEN = new Set(['\r', '\n', '"', '\u0000']);
+/** Longest NULL spelling anyone plausibly wants; `\N`, `NULL` and `<nil>` all fit. */
+const MAX_NULL_TEXT_LENGTH = 32;
+
+/**
+ * One export request.
+ *
+ * There is deliberately no `path` key, and `exactKeys` is what enforces it: the
+ * destination comes from `dialog.showSaveDialog` in main. Accepting a path here
+ * would let a compromised renderer write anywhere the user's account can.
+ *
+ * The delimiter and NULL text are constrained beyond "is a string" because both
+ * end up inside records. A delimiter of `"` would make every field's quoting
+ * ambiguous, a NULL text containing a newline would split one record into two, and
+ * neither produces an error — only a file that reads back as something else.
+ */
+export function validateExportStart(value: unknown): ExportStartRequest {
+  const record = object(value, 'request');
+  exactKeys(record, ['resultId', 'options'], '');
+  return {
+    resultId: str(record['resultId'], 'resultId', { max: MAX_ID_LENGTH }),
+    options: exportOptions(record['options'], 'options'),
+  };
+}
+
+function exportOptions(value: unknown, field: string): ExportOptions {
+  const record = object(value, field);
+  exactKeys(
+    record,
+    [
+      'format',
+      'delimiter',
+      'includeHeader',
+      'nullText',
+      'encoding',
+      'lineEnding',
+      'writeBom',
+      'rowsPerInsert',
+    ],
+    field,
+  );
+
+  // `str` with `max: 1` and no `allowEmpty` already guarantees exactly one
+  // character; only the *which* character check is left to do here.
+  const delimiter = str(record['delimiter'], nested(field, 'delimiter'), { max: 1 });
+  if (DELIMITER_FORBIDDEN.has(delimiter)) {
+    throw new ValidationError(
+      nested(field, 'delimiter'),
+      'cannot be a line break, a quote or a NUL byte',
+    );
+  }
+
+  const nullText = str(record['nullText'], nested(field, 'nullText'), {
+    max: MAX_NULL_TEXT_LENGTH,
+    allowEmpty: true,
+  });
+  // CONTROL_CHARS covers CR, LF and NUL, and rejecting the rest is not overreach:
+  // a tab would collide with a TSV delimiter and no other control character is a
+  // spelling anyone wants for NULL.
+  if (CONTROL_CHARS.test(nullText)) {
+    throw new ValidationError(nested(field, 'nullText'), 'cannot contain control characters');
+  }
+
+  return {
+    format: oneOf(record['format'], EXPORT_FORMATS, nested(field, 'format')),
+    delimiter,
+    includeHeader: bool(record['includeHeader'], nested(field, 'includeHeader')),
+    nullText,
+    encoding: oneOf(record['encoding'], EXPORT_ENCODINGS, nested(field, 'encoding')),
+    lineEnding: oneOf(record['lineEnding'], EXPORT_LINE_ENDINGS, nested(field, 'lineEnding')),
+    writeBom: bool(record['writeBom'], nested(field, 'writeBom')),
+    rowsPerInsert: int(record['rowsPerInsert'], nested(field, 'rowsPerInsert'), 1, 10_000),
+  };
+}
+
+export function validateExportId(value: unknown): string {
+  return str(value, 'exportId', { max: MAX_ID_LENGTH });
 }
 
 export function validateSettingsPatch(value: unknown): SettingsPatch {

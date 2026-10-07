@@ -35,33 +35,37 @@ learn from.
 
 ## Status
 
-**Phases 0–6 complete, Phase 7 in progress** — a hardened Electron shell, a from-scratch canvas data
-grid that scrolls **1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel (pointer
-and keyboard selection, five clipboard formats, context menu, cell inspector, ARIA proxy grid), a
-validated three-process IPC contract with keychain-encrypted credentials, a **real Postgres data
-layer** verified against live PostgreSQL 18, that data layer **driving the grid** (pick a connection,
-browse a table, scroll 10M rows at 60fps), a **schema explorer** (hand-built virtualised tree, a detail
-pane that matches `psql`'s `\d+`, generated DDL, right-click actions), and now a **query console**: a
-hand-written Postgres lexer, a statement splitter that is not fooled by a `;` in a string, comment or
-`$$` body, a syntax-highlighted editor, one tab per statement, and a Cancel button that really stops a
-runaway query.
+**Phases 0–8 complete** — a hardened Electron shell, a from-scratch canvas data grid that scrolls
+**1,000,000 rows × 30 columns at a measured 60fps** and behaves like Excel (pointer and keyboard
+selection, five clipboard formats, context menu, cell inspector, ARIA proxy grid), a validated
+three-process IPC contract with keychain-encrypted credentials, a **real Postgres data layer** verified
+against live PostgreSQL 18, that data layer **driving the grid** (pick a connection, browse a table,
+scroll 10M rows at 60fps), a **schema explorer** (hand-built virtualised tree, a detail pane that
+matches `psql`'s `\d+`, generated DDL, right-click actions), a **query console** (hand-written Postgres
+lexer, a statement splitter not fooled by a `;` in a string, comment or `$$` body, syntax-highlighted
+editor, one tab per statement, a Cancel button that really stops a runaway query, and rotating JSONL
+**query history**), and now **export & polish**: streamed CSV / TSV / JSON / SQL-`INSERT` export that
+writes from main and never touches the renderer, a hand-written fuzzy **command palette**, a dark/light
+**theme**, and **i18n hooks**.
 
-_Query history and the `EXPLAIN` plan tree are the two Phase 7 deliverables still missing. Both of the
-phase's exit criteria already pass — see `PLAN.md` §Phase 7._
+_The `EXPLAIN` plan tree is the one listed deliverable still missing — Explain runs `explain (format
+text)` into the grid, which is complete information but not a rendered tree. Deferred with a reason in
+`PLAN.md` §Phase 7, not quietly dropped._
 
-| Check                         | Result                                                                                                                                                                     |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                                                                                         |
-| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                                                                                    |
-| `npm run typecheck`           | ✅ node + web projects                                                                                                                                                     |
-| `npm test`                    | ✅ **1,252 tests**, 44 files (the 57 integration tests skip when no database is configured)                                                                                |
-| `npm run test:pg`             | ✅ **57 tests** against live PostgreSQL 18.6 — read-only enforcement, cursor jumps, cancelling a run that has not registered, type fidelity, `\d+` fidelity, registry soak |
-| `npm run build`               | ✅ main (3 entries) · preload · renderer                                                                                                                                   |
-| `npm run smoke` (prod CSP)    | ✅ **83/83 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav, copy, IPC round-trip, 8/8 hostile payloads rejected, explorer + editor mount clean    |
-| `npm run smoke:dev` (dev CSP) | ✅ **83/83** — both correctly **allowed** under the dev policy                                                                                                             |
-| `npm run smoke` + a database  | ✅ **114/114** — adds the columnar codec and catalog payload across _Electron's_ serializer, and cancels a real `pg_sleep(60)` **through the UI**                          |
-| `npm run bench` (grid)        | ✅ live 10M×4: p95 **3.40ms** · live 200k×17: p95 **2.80ms** · synthetic 1M×30: p95 **2.8–5.3ms** across runs — all **60.0 fps**, 10ms budget                              |
-| `npm run bench` (tree)        | ✅ **2,025 rows in the tree, 26 elements in the DOM** — p95 **1.90ms** per frame, **59.9 fps**, 0 dropped over 600 frames (8ms / 55fps budget)                             |
+| Check                         | Result                                                                                                                                                                                                                                      |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run deps:check`          | ✅ runtime deps = `pg@8.23.0` only                                                                                                                                                                                                          |
+| `npm run lint`                | ✅ 0 errors, 0 warnings                                                                                                                                                                                                                     |
+| `npm run typecheck`           | ✅ node + web projects                                                                                                                                                                                                                      |
+| `npm test`                    | ✅ **1,746 tests**, 57 files (the 64 integration tests skip when no database is configured)                                                                                                                                                 |
+| `npm run test:pg`             | ✅ **64 tests** against live PostgreSQL 18.6 — read-only enforcement, cursor jumps, cancelling a run that has not registered, type fidelity, `\d+` fidelity, registry soak, **and a 1M-row export**                                         |
+| `npm run i18n:check`          | ✅ 47 catalogue keys, **63 `t()` call sites**, no missing keys                                                                                                                                                                              |
+| `npm run build`               | ✅ main (3 entries) · preload · renderer                                                                                                                                                                                                    |
+| `npm run smoke` (prod CSP)    | ✅ **108/108 assertions** — paints, `eval` + inline scripts **blocked**, keyboard nav, copy, IPC round-trip, **13/13 hostile payloads rejected** (8 IPC + 5 history), explorer + editor + history + palette + theme all mount clean         |
+| `npm run smoke:dev` (dev CSP) | ✅ **108/108** — both correctly **allowed** under the dev policy                                                                                                                                                                            |
+| `npm run smoke` + a database  | ✅ **149/149** — adds the columnar codec and catalog payload across _Electron's_ serializer, cancels a real `pg_sleep(60)` **through the UI**, refuses a **smuggled export path**, and exports 200k rows with a **0MB** renderer-heap delta |
+| `npm run bench` (grid)        | ✅ live 10M×4: p95 **3.30ms** · **59.9 fps** · 10ms budget                                                                                                                                                                                  |
+| `npm run bench` (tree)        | ✅ **2,025 rows in the tree, 26 elements in the DOM** — p95 **1.90ms** per frame, **59.9 fps**, 0 dropped over 600 frames (8ms / 55fps budget)                                                                                              |
 
 Runtime confirmed as **Electron 44.4.5 / Chromium 152.0.7977.130 / Node 24.21.0**, with no
 `require`, `process`, `Buffer`, or `ipcRenderer` leaking into the renderer, `window.tabby` frozen,
@@ -130,6 +134,41 @@ and then pass. A related find: a result only enters main's registry once its fir
 runaway query — which by definition has produced nothing — could not be cancelled at all.
 `QueryService.pendingRuns` closes that; cancelling an unregistered run measures **1.1ms**.
 
+**Leaving a query result on screen for a minute used to crash the app.** `pg`'s `Pool` emits `'error'`
+for _idle_ clients only, and the pool has always had a handler for that. A client handed out by
+`acquire()` is not idle, so its errors went to the client's own `EventEmitter` — and an `'error'` event
+with no listener is rethrown by Node as an uncaught exception, taking main down. The trigger is
+completely ordinary: a result tab holds a `REPEATABLE READ` transaction open, and
+`idle_in_transaction_session_timeout` is 60s. This was found only after the smoke harness was taught to
+print a crash instead of hanging — before that, an unhandled rejection inside `app.whenReady().then(…)`
+left Electron alive with nothing left to exit, and ten minutes of wall clock produced **no output at
+all**. A harness whose whole job is to report was silent.
+
+**A Vue reactive Proxy cannot cross the Electron bridge.** The export dialog keeps its options in a
+`ref`, so what reached `exportStart` was a Proxy, and structured clone rejected it with "An object could
+not be cloned". Because the bridge helper turns any rejection into a tagged `Result`, that surfaced as
+`NOT_CONNECTED` — which reads as "main has no handler for this channel", a completely different bug
+from the real one. **No unit test could have caught it**, because a stubbed bridge accepts anything; the
+smoke harness driving the real dialog is what found it. The regression test now asserts
+`isReactive(sent.options) === false` explicitly.
+
+**The memory metric had to change before the number meant anything.** The first version of the live
+export test asserted on _peak_ `heapUsed` and reported **435MB** — over PLAN's 150MB budget — for an
+export that holds one 5,000-row batch. `heapUsed` without a collection is V8's _uncollected garbage_,
+and a serialiser that allocates a string per row produces a great deal of it. Peak-during measures the
+allocator's laziness; **retained-after-GC** measures whether anything was buffered, which is the actual
+question. The assertion now forces a collection and reads **−0.5MB**. `npm run test:pg` supplies
+`--expose-gc`, and the spec throws rather than silently falling back if it is missing — a bound asserted
+against uncollected garbage is a measurement of nothing.
+
+**Export has no path field, and that is the security design.** `ExportStartRequest` carries a result id
+and options; the destination comes from `dialog.showSaveDialog` in main, so the only way bytes reach the
+disk is through a picker the user just confirmed. Accepting a path from the renderer would let a
+compromised one write anywhere the user's account can — a strictly worse posture than the one
+`safeStorage` gives passwords. The harness asserts it end to end: it smuggles
+`path: '/tmp/tabby-smuggled.csv'`, then checks both that the call is refused and that **no file appears
+there**.
+
 **Not yet verified by a human:** a real VoiceOver pass over the ARIA proxy grid **or** the
 `role="tree"` (the tree carries `aria-level`/`aria-posinset`/`aria-setsize`, which is the documented
 pattern for a virtualised list, but it has not been listened to), macOS full-screen restore, text
@@ -138,6 +177,14 @@ highlight layer and its textarea actually stay aligned on a real screen at a rea
 one is asserted character-for-character in code and in Chromium, but "aligned" is ultimately a thing
 eyes confirm. The bench and smoke harnesses drive the real DOM against a real database, which proves
 the wiring and the frame budget, but not the feel.
+
+New in Phase 8, and in the same category: whether the **light theme is actually pleasant**. The harness
+proves `getComputedStyle(document.body).backgroundColor` goes from `rgb(3, 11, 22)` to
+`rgb(255, 255, 255)` and back, which is a fact about the cascade and not about contrast ratios — no
+WCAG audit has been run on either palette. No screen reader has been over the palette's
+`combobox`/`listbox` wiring or the export dialog. And the native **save dialog has never been driven**:
+no harness can click a sheet, so `save-dialog.ts` is the one Phase 8 file whose coverage stops at
+typechecking.
 
 **A known gap in the perf gate, found while measuring and deliberately left alone.** The grid bench
 computes `sustainedFps` but does not fail on it: a run contaminated by a concurrent `npm run dev`
@@ -155,6 +202,7 @@ npm run dev        # Vite dev server + Electron with HMR
 
 ```bash
 npm run verify     # deps:check + lint + typecheck + test + build
+npm run i18n:check # every t() key exists in the catalogue; unused keys warn
 npm run smoke      # boots real Electron, asserts the security model
 npm run bench      # 600-frame scroll benchmarks for the grid and the tree —
                    # run on an otherwise idle machine

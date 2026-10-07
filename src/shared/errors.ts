@@ -25,6 +25,8 @@ export type TabbyErrorCode =
   | 'RESULT_EVICTED'
   | 'CURSOR_CLOSED'
   | 'RESULT_NOT_FOUND'
+  // export
+  | 'EXPORT_BUSY'
   // plumbing
   | 'VALIDATION_FAILED'
   | 'NOT_CONNECTED'

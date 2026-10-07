@@ -13,12 +13,16 @@ import {
   ValidationError,
   validateConnSave,
   validateConnectionId,
+  validateHistoryAdd,
+  validateHistoryId,
+  validateHistoryLimit,
   validateQueryRun,
   validateResultWindow,
   validateSchemaChildren,
   validateSchemaTable,
   validateSettingsPatch,
 } from '../../src/main/ipc/validate';
+import { HISTORY_LIMITS } from '../../src/shared/history';
 
 describe('primitive shape checks', () => {
   it('accepts a well-formed result window request', () => {
@@ -396,6 +400,121 @@ describe('settings patch', () => {
 
   it('rejects an unknown patch key', () => {
     expect(() => validateSettingsPatch({ theme: 'dark', isAdmin: true })).toThrow(/isAdmin/);
+  });
+});
+
+describe('query history payloads', () => {
+  function historyFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      sql: "select * from fixtures.big where token = 'not-a-secret'",
+      connectionId: 'c1',
+      connectionLabel: 'Local · localhost:5432/postgres',
+      status: 'ok',
+      elapsedMs: 12,
+      rowCount: 1000,
+      ...overrides,
+    };
+  }
+
+  it('accepts a well-formed record and passes the SQL through untouched', () => {
+    // History stores what the user typed. Rewriting it here — collapsing
+    // whitespace, stripping a literal that looks like a secret — would make the
+    // restored statement a different query from the one that ran.
+    const sql = "select 'a\nb'";
+    expect(validateHistoryAdd(historyFixture({ sql }))).toEqual({
+      sql,
+      connectionId: 'c1',
+      connectionLabel: 'Local · localhost:5432/postgres',
+      status: 'ok',
+      elapsedMs: 12,
+      rowCount: 1000,
+    });
+  });
+
+  it.each(['ok', 'failed', 'cancelled'])('accepts status %s', (status) => {
+    expect(validateHistoryAdd(historyFixture({ status })).status).toBe(status);
+  });
+
+  it('accepts the -1 sentinel for a run that produced no number', () => {
+    const parsed = validateHistoryAdd(historyFixture({ elapsedMs: -1, rowCount: -1 }));
+    expect(parsed.elapsedMs).toBe(-1);
+    expect(parsed.rowCount).toBe(-1);
+  });
+
+  it('accepts an empty connection label', () => {
+    // A connection deleted between the run and the record has no summary to
+    // label it with; refusing the record would lose the query too.
+    expect(validateHistoryAdd(historyFixture({ connectionLabel: '' })).connectionLabel).toBe('');
+  });
+
+  it('rejects an unknown status rather than storing one', () => {
+    expect(() => validateHistoryAdd(historyFixture({ status: 'exploded' }))).toThrow(/status/);
+  });
+
+  it('rejects a NUL byte in the SQL', () => {
+    // The same check `query:run` applies. A NUL reaching a JSONL file would be a
+    // record boundary waiting to happen, and server-side it would split one
+    // statement into two.
+    expect(() => validateHistoryAdd(historyFixture({ sql: 'select\u0000 1' }))).toThrow(/NUL/);
+  });
+
+  it('rejects an unknown key, so a renderer cannot smuggle an id or a timestamp', () => {
+    // Both are main's to generate; accepting them would let a caller backdate or
+    // collide history entries.
+    expect(() => validateHistoryAdd(historyFixture({ id: 'mine' }))).toThrow(/id/);
+    expect(() => validateHistoryAdd(historyFixture({ ranAt: 1 }))).toThrow(/ranAt/);
+  });
+
+  it('rejects a missing required field', () => {
+    const payload = historyFixture();
+    delete payload['sql'];
+    expect(() => validateHistoryAdd(payload)).toThrow(/sql/);
+  });
+
+  it('rejects a non-finite elapsed time', () => {
+    expect(() => validateHistoryAdd(historyFixture({ elapsedMs: Number.NaN }))).toThrow(
+      /elapsedMs/,
+    );
+    expect(() => validateHistoryAdd(historyFixture({ rowCount: Number.NaN }))).toThrow(/rowCount/);
+  });
+
+  it('rejects a negative row count below the sentinel', () => {
+    expect(() => validateHistoryAdd(historyFixture({ rowCount: -2 }))).toThrow(/rowCount/);
+  });
+
+  it('rejects prototype pollution in the record', () => {
+    const raw = `{"sql":"select 1","connectionId":"c1","connectionLabel":"",
+      "status":"ok","elapsedMs":1,"rowCount":1,"__proto__":{"isAdmin":true}}`;
+    expect(() => validateHistoryAdd(JSON.parse(raw))).toThrow(/__proto__/);
+    expect(({} as { isAdmin?: boolean }).isAdmin).toBeUndefined();
+  });
+
+  it('defaults an omitted limit to the retention cap', () => {
+    expect(validateHistoryLimit(undefined)).toBe(HISTORY_LIMITS.maxEntriesReturned);
+  });
+
+  it('accepts a limit within bounds', () => {
+    expect(validateHistoryLimit(1)).toBe(1);
+    expect(validateHistoryLimit(HISTORY_LIMITS.maxEntriesReturned)).toBe(
+      HISTORY_LIMITS.maxEntriesReturned,
+    );
+  });
+
+  it('refuses a limit that would pull the whole log into one response', () => {
+    expect(() => validateHistoryLimit(HISTORY_LIMITS.maxEntriesReturned + 1)).toThrow(/limit/);
+    expect(() => validateHistoryLimit(Number.MAX_SAFE_INTEGER)).toThrow(/limit/);
+  });
+
+  it('refuses a zero, negative or fractional limit', () => {
+    expect(() => validateHistoryLimit(0)).toThrow(/limit/);
+    expect(() => validateHistoryLimit(-1)).toThrow(/limit/);
+    expect(() => validateHistoryLimit(1.5)).toThrow(/limit/);
+  });
+
+  it('bounds a history id like every other id on the bridge', () => {
+    expect(validateHistoryId('h1')).toBe('h1');
+    expect(() => validateHistoryId('')).toThrow(ValidationError);
+    expect(() => validateHistoryId('x'.repeat(200))).toThrow(/historyId/);
   });
 });
 

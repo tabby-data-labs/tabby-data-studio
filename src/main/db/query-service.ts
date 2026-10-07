@@ -122,6 +122,22 @@ export interface ResultLimits {
   readonly maxBytes?: number;
 }
 
+/**
+ * Everything an export needs to re-run a result independently.
+ *
+ * `insertTarget` is the unquoted catalog name pair, not a rendered identifier:
+ * quoting is the exporter's decision, and handing it a pre-quoted string would mean
+ * two places agreeing on how to quote.
+ */
+export interface ExportDescription {
+  readonly connectionId: string;
+  /** The full statement, never a paged fragment. */
+  readonly sql: string;
+  readonly columns: readonly ColumnMeta[];
+  /** Non-null only for a plain table scan, which is the only result with a name. */
+  readonly insertTarget: { readonly schema: string; readonly table: string } | null;
+}
+
 export interface QueryServiceDeps {
   readonly connections: ConnectionManager;
   readonly schemas: SchemaService;
@@ -560,6 +576,41 @@ export class QueryService {
     const entry = this.registry.get(resultId);
     if (!entry) return err<ResultMeta>(this.missingResult(resultId));
     return ok(this.metaOf(entry.payload));
+  }
+
+  /**
+   * What an export needs to re-run a result on its own connection (Phase 8).
+   *
+   * **Deliberately a description, not the cursor itself.** An export cannot read
+   * through the result's own cursor: that cursor is `NO SCROLL` and positioned, so
+   * draining it would move `paging.position` out from under the grid and leave the
+   * tab showing rows it no longer has. Exporting therefore opens a second cursor on
+   * a second client, which means a second `REPEATABLE READ` snapshot — so a file
+   * exported while the table is being written can differ from what was on screen.
+   * That is the honest trade: sharing the cursor would corrupt the UI, and a viewer
+   * that silently exported stale-or-not data with no rule would be worse.
+   *
+   * The `sql` branch matters: for an unpaged browse, `state.sql` is the *keyset
+   * page* with its `LIMIT`, and exporting that would write `initialRows` rows and
+   * call it the table. `baseSql` is the whole scan. Once the user sorts, the result
+   * becomes a cursor and `state.sql` is already the full sorted query.
+   */
+  exportDescription(resultId: string): Result<ExportDescription> {
+    const entry = this.registry.get(resultId);
+    if (!entry) return err<ExportDescription>(this.missingResult(resultId));
+    const state = entry.payload;
+    const paging = state.paging;
+
+    return ok({
+      connectionId: state.connectionId,
+      sql: paging.kind === 'browse' ? state.baseSql : state.sql,
+      columns: state.columns,
+      // Only a plain table scan has a name to insert into. An arbitrary statement
+      // has none, and inventing one would produce a file that claims a target it
+      // did not come from.
+      insertTarget:
+        paging.kind === 'browse' ? { schema: paging.schema, table: paging.table } : null,
+    });
   }
 
   private metaOf(state: LiveResult): ResultMeta {

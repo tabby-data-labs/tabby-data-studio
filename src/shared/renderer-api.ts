@@ -7,6 +7,7 @@
 import type {
   ConnectionLostEvent,
   DatabaseApi,
+  ExportProgressEvent,
   QueryProgressEvent,
   ResultEvictedEvent,
 } from './ipc-contract';
@@ -32,6 +33,7 @@ export interface TabbyEvents {
   onQueryProgress(listener: (event: QueryProgressEvent) => void): Unsubscribe;
   onConnectionLost(listener: (event: ConnectionLostEvent) => void): Unsubscribe;
   onResultEvicted(listener: (event: ResultEvictedEvent) => void): Unsubscribe;
+  onExportProgress(listener: (event: ExportProgressEvent) => void): Unsubscribe;
 }
 
 export interface TabbyApi {

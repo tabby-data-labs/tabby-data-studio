@@ -14,7 +14,54 @@
   --color-fg: #e6edf7;
   --color-muted: #8ba0bb;
 
+  /* Syntax highlighting. Variables rather than literals in the component because
+     the token colours are the one palette that cannot be derived from the eight
+     above: a dark-theme string colour on a white background is unreadable, and
+     the highlight layer is generated HTML that carries no scope attribute. */
+  --color-tok-keyword: #7aa2f7;
+  --color-tok-ident: #e6edf7;
+  --color-tok-quoted: #9ece6a;
+  --color-tok-string: #e0af68;
+  --color-tok-number: #ff9e64;
+  --color-tok-punctuation: #8ba0bb;
+  --color-tok-comment: #565f89;
+  --color-tok-param: #bb9af7;
+
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/*
+ * The light theme (PLAN Phase 8).
+ *
+ * Overriding the same custom properties — rather than adding a parallel set of
+ * utilities — is what makes this a one-attribute change: every `bg-surface`,
+ * `border-line` and `text-muted` in every component follows, including the ones
+ * written before the theme existed. `:root[data-theme]` outranks the bare `:root`
+ * that `@theme` emits, so no `!important` is needed anywhere.
+ *
+ * The accent tints used for buttons and selection (`rgba(28,58,94,…)`,
+ * `rgba(59,118,240,…)`) are deliberately left alone in the components: they are
+ * translucent washes, and a wash reads correctly on both backgrounds. Only opaque
+ * colours need a second value.
+ */
+:root[data-theme='light'] {
+  --color-surface: #ffffff;
+  --color-panel: #f1f5f9;
+  --color-line: #cbd5e1;
+  --color-accent: #2563eb;
+  --color-ok: #15803d;
+  --color-warn: #92600a;
+  --color-fg: #14202e;
+  --color-muted: #64748b;
+
+  --color-tok-keyword: #1d4ed8;
+  --color-tok-ident: #14202e;
+  --color-tok-quoted: #15803d;
+  --color-tok-string: #92600a;
+  --color-tok-number: #b45309;
+  --color-tok-punctuation: #64748b;
+  --color-tok-comment: #94a3b8;
+  --color-tok-param: #7c3aed;
 }
 
 html,
@@ -30,4 +77,53 @@ body {
   font-family: var(--font-mono);
   -webkit-font-smoothing: antialiased;
   user-select: none;
+}
+
+/*
+ * Native controls inherit the theme rather than the platform default, so a light
+ * UI does not get dark scrollbars and a dark date picker.
+ */
+:root {
+  color-scheme: dark;
+}
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+/*
+ * Syntax highlighting for the editor's `<pre>` layer.
+ *
+ * These rules live here rather than in QueryEditor.vue for two reasons. The spans
+ * are generated HTML, so they carry no Vue scope attribute and a scoped selector
+ * cannot match them. And Tailwind only emits a `@theme` variable that something
+ * references — keeping the reference in the same stylesheet as the declaration is
+ * what guarantees `--color-tok-*` reaches the built CSS instead of being shaken
+ * out as unused.
+ */
+.tok-keyword {
+  color: var(--color-tok-keyword);
+  font-weight: 600;
+}
+.tok-ident {
+  color: var(--color-tok-ident);
+}
+.tok-quoted {
+  color: var(--color-tok-quoted);
+}
+.tok-string {
+  color: var(--color-tok-string);
+}
+.tok-number {
+  color: var(--color-tok-number);
+}
+.tok-operator,
+.tok-punctuation {
+  color: var(--color-tok-punctuation);
+}
+.tok-comment {
+  color: var(--color-tok-comment);
+  font-style: italic;
+}
+.tok-param {
+  color: var(--color-tok-param);
 }

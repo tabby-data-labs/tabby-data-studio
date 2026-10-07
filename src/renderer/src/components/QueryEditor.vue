@@ -33,6 +33,7 @@ const emit = defineEmits<{
   run: [statements: readonly SqlStatement[]];
   explain: [statement: SqlStatement];
   cancel: [];
+  history: [];
 }>();
 
 /** Pixels, and the single source of truth for the gutter, the rule and the sync. */
@@ -185,7 +186,7 @@ onMounted(() => {
   syncScroll();
 });
 
-defineExpose({ setText, titleFor });
+defineExpose({ setText, titleFor, runHere, runAll, explainHere });
 </script>
 
 <template>
@@ -208,6 +209,9 @@ defineExpose({ setText, titleFor });
         @click="emit('cancel')"
       >
         Cancel{{ runningLabel === null ? '' : ` ${runningLabel}` }}
+      </button>
+      <button type="button" class="btn" data-history-toggle @click="emit('history')">
+        History
       </button>
 
       <span class="meta" :data-statement-count="statementCount">
@@ -400,40 +404,5 @@ defineExpose({ setText, titleFor });
 .input::selection {
   background: rgba(59, 118, 240, 0.35);
   color: transparent;
-}
-</style>
-
-<style>
-/*
- * Token colours are global rather than scoped: the spans are created by
- * `highlightToHtml` as a raw HTML string, so they carry no scope attribute and a
- * scoped selector would not match them.
- */
-.tok-keyword {
-  color: #7aa2f7;
-  font-weight: 600;
-}
-.tok-ident {
-  color: var(--color-fg);
-}
-.tok-quoted {
-  color: #9ece6a;
-}
-.tok-string {
-  color: #e0af68;
-}
-.tok-number {
-  color: #ff9e64;
-}
-.tok-operator,
-.tok-punctuation {
-  color: #8ba0bb;
-}
-.tok-comment {
-  color: #565f89;
-  font-style: italic;
-}
-.tok-param {
-  color: #bb9af7;
 }
 </style>

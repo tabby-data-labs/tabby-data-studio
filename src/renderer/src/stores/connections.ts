@@ -31,6 +31,21 @@ export const useConnectionsStore = defineStore('connections', () => {
     return opened.value.includes(connectionId);
   }
 
+  /**
+   * The one-line label for a connection, used by the tree's root and by query
+   * history.
+   *
+   * A function rather than a computed on `active`, because history has to label
+   * connections that are no longer selected — and, being denormalised into the
+   * stored record, ones that no longer exist.
+   */
+  function labelFor(connectionId: string): string {
+    const summary = list.value.find((candidate) => candidate.id === connectionId);
+    return summary === undefined
+      ? connectionId
+      : `${summary.name} · ${summary.host}:${summary.port}/${summary.database}`;
+  }
+
   function fail(next: TabbyError | null): void {
     error.value = next;
   }
@@ -165,6 +180,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     notice,
     loadWarning,
     isOpen,
+    labelFor,
     load,
     save,
     remove,

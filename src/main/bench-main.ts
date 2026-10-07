@@ -22,6 +22,7 @@ import { applySecurityGuards } from './security/navigation';
 import { registerIpcHandlers } from './ipc/router';
 import { createDbServices, type DbServices } from './db/services';
 import { SettingsStore } from './store/settings-store';
+import { HistoryStore } from './store/history-store';
 import type { SecretCipher } from './store/cipher';
 
 const target =
@@ -242,9 +243,16 @@ app
         decrypt: (ct) => Buffer.from(ct.slice(4, -1), 'base64').toString('utf8'),
       };
       settingsDir = mkdtempSync(join(tmpdir(), 'tabby-bench-'));
-      const settings = new SettingsStore({ dir: settingsDir, cipher });
+      // A local copy, because `settingsDir` is a module-level `let` and TypeScript
+      // cannot narrow it inside the `pickPath` closure below.
+      const dir = settingsDir;
+      const settings = new SettingsStore({ dir, cipher });
+      const history = new HistoryStore({ dir: join(dir, 'history') });
       services = createDbServices({
         settings,
+        // The bench never exports, but the dependency is required rather than
+        // defaulted so that no entry point can silently get a different one.
+        pickPath: async (suggested) => join(dir, 'exports', suggested),
         // Same wiring as `src/main/index.ts`. Without it the renderer never sees a
         // progress event, so the exact row count never replaces the `reltuples`
         // estimate and the benchmark would be measuring a scrollbar that lies.
@@ -258,6 +266,8 @@ app
         connections: services.connections,
         schemas: services.schemas,
         queries: services.queries,
+        history,
+        exports: services.exports,
       });
       // Saved before the renderer mounts, so the connection store's initial load
       // already sees it and the UI has something to select.

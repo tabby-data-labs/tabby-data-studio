@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, shallowReactive, shallowRef, watch } from 'vue';
 import { quoteQualified } from '@shared/ident';
 import type { SqlStatement } from '@shared/sql-split';
 import ConnectionBar from '@/components/ConnectionBar.vue';
+import CommandPalette from '@/components/CommandPalette.vue';
 import DataGridVue from '@/components/DataGridVue.vue';
+import ExportDialog from '@/components/ExportDialog.vue';
+import HistoryPanel from '@/components/HistoryPanel.vue';
 import QueryEditor from '@/components/QueryEditor.vue';
 import ResultStatus from '@/components/ResultStatus.vue';
 import SchemaTree from '@/components/SchemaTree.vue';
@@ -15,11 +18,16 @@ import type { ClipboardFormat } from '@/grid/clipboard';
 import { FakeDataSource } from '@/grid/fake-source';
 import { boundingBox, selectedCellCount } from '@/grid/selection';
 import type { DataSource, SelectionState, SortSpec } from '@/grid/types';
+import { t } from '@/i18n';
+import type { PaletteCommand } from '@/palette/command';
 import type { TreeRow } from '@/schema/tree-model';
 import { useConnectionsStore } from '@/stores/connections';
+import { useExportsStore, type ExportState } from '@/stores/exports';
+import { useHistoryStore, type RecordInput } from '@/stores/history';
 import { useResultsStore, type RunInput } from '@/stores/results';
 import { useSchemaStore } from '@/stores/schema';
 import { useTabsStore } from '@/stores/tabs';
+import { useUiStore } from '@/stores/ui';
 
 const SYNTHETIC_ROWS = 1_000_000;
 const SYNTHETIC_COLUMNS = 30;
@@ -44,6 +52,18 @@ const connections = useConnectionsStore();
 const results = useResultsStore();
 const schema = useSchemaStore();
 const tabs = useTabsStore();
+const history = useHistoryStore();
+const exportStore = useExportsStore();
+const ui = useUiStore();
+
+/**
+ * Held so history can put a statement back into the editor.
+ *
+ * The editor exposes `setText` rather than accepting a `sql` prop, because a prop
+ * would make the textarea's contents a function of state the editor also owns —
+ * typing would fight the binding. An imperative restore is the honest shape here.
+ */
+const editor = ref<InstanceType<typeof QueryEditor> | null>(null);
 
 const grid = shallowRef<DataGrid | null>(null);
 const frozen = ref(1);
@@ -104,19 +124,45 @@ onMounted(async () => {
     connectionId: null,
   });
 
+  // Everything above this line must work with no bridge at all, so the theme and
+  // the global shortcuts are registered before the guard rather than after it.
+  // The theme was applied to `<html>` by `main.ts` before mounting; this makes the
+  // store agree with the document without a second settings read.
+  ui.apply();
+  document.addEventListener('keydown', onGlobalKeydown);
+
   if (!window.tabby) return;
   versions.value = { ...window.tabby.versions };
   // One subscription for the whole app rather than one per result: a listener
   // attached per tab leaks the moment tabs start closing.
   results.subscribe();
   schema.subscribe();
+  exportStore.subscribe();
   await connections.load();
 });
 
 onBeforeUnmount(() => {
   results.unsubscribe();
   schema.unsubscribe();
+  exportStore.unsubscribe();
+  document.removeEventListener('keydown', onGlobalKeydown);
 });
+
+/**
+ * Global shortcuts that must work wherever focus is.
+ *
+ * ⌘K opens the palette. Escape closes the topmost overlay first and only then
+ * reaches the grid, so clearing a selection cannot also dismiss a dialog the user
+ * was in the middle of filling in.
+ */
+function onGlobalKeydown(event: KeyboardEvent): void {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+    event.preventDefault();
+    ui.togglePalette();
+    return;
+  }
+  if (event.key === 'Escape' && ui.closeTopOverlay()) event.stopPropagation();
+}
 
 /**
  * Reconciles live results against the tab strip.
@@ -135,15 +181,16 @@ watch(
   },
 );
 
-async function onRun(input: RunInput): Promise<void> {
+async function onRun(input: RunInput): Promise<string | null> {
   notice.value = null;
   const started = await results.run(input);
-  if (!started.ok) return;
+  if (!started.ok) return null;
   tabs.openResult({
     resultId: started.value,
     title: input.title,
     connectionId: input.connectionId,
   });
+  return started.value;
 }
 
 // ── Query console (Phase 7) ──────────────────────────────────────────────────
@@ -181,6 +228,10 @@ async function onRunStatements(statements: readonly SqlStatement[]): Promise<voi
   notice.value = null;
   cancelled = false;
 
+  // Captured once per script: the label is denormalised into every record, so a
+  // connection renamed mid-script should not produce two spellings of one run.
+  const connectionLabel = connections.labelFor(connectionId);
+
   for (const statement of statements) {
     if (cancelled) break;
     const title = titleFor(statement);
@@ -194,15 +245,38 @@ async function onRunStatements(statements: readonly SqlStatement[]): Promise<voi
     });
 
     if (!started.ok) {
-      if (started.error.code === 'QUERY_CANCELLED') {
+      const wasCancelled = started.error.code === 'QUERY_CANCELLED';
+      if (wasCancelled) {
         cancelled = true;
         notice.value = 'Cancelled';
       }
+      // A failed statement is recorded too — it is the one the user most wants
+      // back, because the next thing they do is fix it and run it again.
+      await recordHistory({
+        sql: statement.text,
+        connectionId,
+        connectionLabel,
+        status: wasCancelled ? 'cancelled' : 'failed',
+        elapsedMs: -1,
+        rowCount: -1,
+      });
       break;
     }
 
     const id = started.value;
     const meta = results.metas.get(id);
+    await recordHistory({
+      sql: statement.text,
+      connectionId,
+      connectionLabel,
+      status: 'ok',
+      elapsedMs: meta?.elapsedMs ?? -1,
+      // Only an exact count is recorded. The `reltuples` estimate main reports
+      // first is a guess about the table, not an answer about this statement, and
+      // writing it down as though it were one is how a UI starts lying.
+      rowCount: meta === undefined || meta.rowCountIsEstimate ? -1 : meta.rowCount,
+    });
+
     tabs.openResult({
       resultId: id,
       // Per-statement timing in the tab, so five results can be compared without
@@ -214,6 +288,25 @@ async function onRunStatements(statements: readonly SqlStatement[]): Promise<voi
   }
 
   runningTitle.value = null;
+}
+
+/**
+ * Writes one run to query history.
+ *
+ * Awaited so the entry is in the panel before the next statement of a script runs,
+ * but a failure becomes a notice and never an abort: the query already happened,
+ * and a full disk or a locked `userData` must not turn a successful `SELECT` into
+ * a half-run script.
+ */
+async function recordHistory(input: RecordInput): Promise<void> {
+  const stored = await history.record(input);
+  if (!stored) notice.value = `Not added to history: ${history.error?.message ?? 'unknown reason'}`;
+}
+
+/** Restores a statement from history into the editor, without running it. */
+function onLoadFromHistory(sql: string): void {
+  editor.value?.setText(sql);
+  notice.value = t('history.loadNotice');
 }
 
 /**
@@ -262,12 +355,7 @@ watch(
   () => [connections.activeId, connections.opened.join(',')] as const,
   ([activeId]) => {
     if (activeId !== null && connections.isOpen(activeId)) {
-      const summary = connections.list.find((candidate) => candidate.id === activeId);
-      const label =
-        summary === undefined
-          ? activeId
-          : `${summary.name} · ${summary.host}:${summary.port}/${summary.database}`;
-      schema.attach(activeId, label);
+      schema.attach(activeId, connections.labelFor(activeId));
       return;
     }
     schema.detach();
@@ -301,13 +389,15 @@ async function onBrowseRelation(row: TreeRow): Promise<void> {
     notice.value = 'That node cannot be browsed';
     return;
   }
-  await onRun({
+  const resultId = await onRun({
     connectionId: row.connectionId,
     sql: statement,
     title: `${row.schema}.${row.label}`,
     browse: { schema: row.schema, table: row.label },
     initialRows: INITIAL_ROWS,
   });
+  // Recorded so the export dialog can name the INSERT target before main is asked.
+  if (resultId !== null) browseTargets.set(resultId, { schema: row.schema, table: row.label });
 }
 
 /**
@@ -498,14 +588,203 @@ function onGoToRow(): void {
   if (!Number.isFinite(row)) return;
   grid.value?.scrollToRow(Math.max(0, Math.min(source.rowCount - 1, row - 1)), 'center');
 }
+
+// ── Export (Phase 8) ─────────────────────────────────────────────────────────
+
+/**
+ * Which results are plain table scans, and of what.
+ *
+ * The renderer knows this because *it* asked for the browse; main derives the same
+ * thing from the result's paging strategy and is authoritative. This copy exists
+ * only so the dialog can show the `INSERT` target before the export starts — main
+ * does not report it until after. Reactive so the computed below re-runs when a
+ * browse tab is opened, which happens after the tab becomes active.
+ */
+const browseTargets = shallowReactive(new Map<string, { schema: string; table: string }>());
+
+const exportInsertTarget = computed<string | null>(() => {
+  const id = liveResultId.value;
+  const target = id === null ? undefined : browseTargets.get(id);
+  if (!target) return null;
+  try {
+    return quoteQualified(target.schema, target.table);
+  } catch {
+    return null;
+  }
+});
+
+async function onCancelExport(exportId: string): Promise<void> {
+  const result = await exportStore.cancel(exportId);
+  if (result.ok) return;
+  // NOT_FOUND means it finished between the click and the bridge call.
+  if (result.error.code === 'NOT_FOUND') return;
+  notice.value = `${t('export.failed', { reason: result.error.message })}`;
+}
+
+function phaseClass(phase: string): string {
+  if (phase === 'done') return 'text-ok';
+  return phase === 'failed' ? 'text-warn' : 'text-muted';
+}
+
+/**
+ * One sentence per export state.
+ *
+ * The bare phase word is what a log wants; a user wants to know how many rows and
+ * where. Every branch is a single catalogue message, so the tray is translatable
+ * rather than four English fragments stitched together in the template.
+ */
+function exportSummary(item: ExportState): string {
+  const rows = item.rowsWritten.toLocaleString();
+  switch (item.phase) {
+    case 'streaming':
+      return t('export.progress', { rows });
+    case 'done':
+      return t('export.done', { rows, file: item.fileName });
+    case 'cancelled':
+      return t('export.cancelled');
+    case 'failed':
+      return t('export.failed', { reason: item.message ?? 'unknown reason' });
+  }
+}
+
+/** Bytes as a human would read them, for a tray that has room for one number. */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1024) return `${Math.max(0, bytes)} B`;
+  const units = ['kB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = -1;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+// ── Command palette (Phase 8) ────────────────────────────────────────────────
+
+/**
+ * The palette's contents, rebuilt on every open.
+ *
+ * Not a static registry: nearly every command's availability depends on live state
+ * — whether a result is open, whether something is running. A command that is
+ * always listed and sometimes inert teaches the user that the palette lies, and
+ * filtering it out is one `if` here.
+ */
+const commands = computed<readonly PaletteCommand[]>(() => {
+  const list: PaletteCommand[] = [];
+  const connected = connections.activeId !== null;
+  const hasResult = liveResultId.value !== null;
+  const run = (): void => editor.value?.runHere();
+
+  if (connected) {
+    list.push(
+      {
+        id: 'query.run',
+        group: 'Query',
+        title: 'Run statement at cursor',
+        hint: '⌘/Ctrl+↵',
+        run,
+      },
+      {
+        id: 'query.runAll',
+        group: 'Query',
+        title: 'Run all statements',
+        hint: '⇧⌘/Ctrl+↵',
+        run: () => editor.value?.runAll(),
+      },
+      {
+        id: 'query.explain',
+        group: 'Query',
+        title: 'Explain statement at cursor',
+        run: () => editor.value?.explainHere(),
+      },
+    );
+  }
+  if (results.running) {
+    list.push({
+      id: 'query.cancel',
+      group: 'Query',
+      title: 'Cancel the running query',
+      run: () => void onCancel(),
+    });
+  }
+  list.push({
+    id: 'query.history',
+    group: 'Query',
+    title: t('history.title'),
+    run: () => history.show(),
+  });
+
+  if (hasResult) {
+    list.push({
+      id: 'result.export',
+      group: 'Result',
+      title: t('export.title'),
+      hint: 'CSV · TSV · JSON · SQL',
+      run: () => ui.openExport(),
+    });
+    for (const format of COPY_FORMATS) {
+      list.push({
+        id: `result.copy.${format}`,
+        group: 'Result',
+        title: `Copy selection as ${format.toUpperCase()}`,
+        run: () => void onCopy(format),
+      });
+    }
+    list.push(
+      {
+        id: 'result.sort',
+        group: 'Result',
+        title: 'Cycle sort on column 1',
+        hint: 'ascending → descending → off',
+        run: () => void onToggleSort(),
+      },
+      {
+        id: 'result.goto',
+        group: 'Result',
+        title: 'Go to row…',
+        run: onGoToRow,
+      },
+      {
+        id: 'result.freezeMore',
+        group: 'Result',
+        title: 'Freeze one more column',
+        run: () => onFreeze(1),
+      },
+      {
+        id: 'result.freezeFewer',
+        group: 'Result',
+        title: 'Unfreeze one column',
+        run: () => onFreeze(-1),
+      },
+    );
+  }
+
+  list.push(
+    {
+      id: 'view.theme',
+      group: 'View',
+      title: `${t('theme.label')}: ${ui.theme === 'dark' ? t('theme.light') : t('theme.dark')}`,
+      run: () => void ui.toggleTheme(),
+    },
+    {
+      id: 'view.bench',
+      group: 'View',
+      title: 'Run the 600-frame scroll benchmark',
+      run: () => void onBench(),
+    },
+  );
+
+  return list;
+});
 </script>
 
 <template>
   <div class="flex h-full flex-col bg-surface">
     <header class="flex items-baseline gap-3 border-b border-line bg-panel px-4 py-2">
-      <h1 class="text-sm font-semibold tracking-wide text-fg">Tabby</h1>
+      <h1 class="text-sm font-semibold tracking-wide text-fg">{{ t('app.name') }}</h1>
       <span class="text-xs text-muted">
-        Phase 7 — {{ liveResultId === null ? 'synthetic grid' : 'live result' }}
+        Phase 8 — {{ liveResultId === null ? 'synthetic grid' : 'live result' }}
       </span>
       <span class="ml-auto text-[11px] text-muted">
         {{ headerSummary }}
@@ -517,12 +796,14 @@ function onGoToRow(): void {
 
     <ConnectionBar />
     <QueryEditor
+      ref="editor"
       :connection-id="connections.activeId"
       :busy="results.running"
       :running-label="runningLabel"
       @run="onRunStatements"
       @explain="onExplain"
       @cancel="onCancel"
+      @history="history.toggle()"
     />
 
     <div
@@ -561,6 +842,28 @@ function onGoToRow(): void {
       </button>
       <button type="button" class="btn" @click="onGoToRow">Go to row…</button>
 
+      <button
+        type="button"
+        class="btn"
+        data-export-open
+        :disabled="liveResultId === null"
+        @click="ui.openExport()"
+      >
+        {{ t('export.start') }}…
+      </button>
+      <button type="button" class="btn" data-palette-open @click="ui.openPalette()">
+        Commands <span class="text-muted">⌘K</span>
+      </button>
+      <button
+        type="button"
+        class="btn"
+        data-theme-toggle
+        :title="t('theme.label')"
+        @click="ui.toggleTheme()"
+      >
+        {{ ui.theme === 'dark' ? t('theme.light') : t('theme.dark') }}
+      </button>
+
       <span class="ml-2 flex items-center gap-1">
         <span class="text-muted">Frozen</span>
         <button type="button" class="btn" @click="onFreeze(-1)">−</button>
@@ -568,7 +871,53 @@ function onGoToRow(): void {
         <button type="button" class="btn" @click="onFreeze(1)">+</button>
       </span>
 
-      <span v-if="notice" class="ml-auto text-ok">{{ notice }}</span>
+      <span v-if="notice" class="ml-auto text-ok" data-notice>{{ notice }}</span>
+    </div>
+
+    <!--
+      Exports in flight and just finished. Always mounted rather than a dialog,
+      because an export outlives the click that started it by minutes and the user
+      needs to be able to look away and come back to it.
+    -->
+    <div
+      v-if="exportStore.all.length > 0"
+      class="flex flex-col gap-1 border-b border-line bg-panel px-4 py-1.5 text-[11px]"
+      data-export-tray
+    >
+      <div
+        v-for="item in exportStore.all"
+        :key="item.exportId"
+        class="flex items-center gap-3"
+        :data-export-row="item.exportId"
+      >
+        <span :class="phaseClass(item.phase)" :data-export-phase="item.phase" class="w-16">
+          {{ item.phase }}
+        </span>
+        <span class="text-fg" data-export-file>{{ item.fileName }}</span>
+        <span class="text-muted" data-export-summary>{{ exportSummary(item) }}</span>
+        <span class="text-muted" data-export-bytes>{{ formatBytes(item.bytesWritten) }}</span>
+        <span v-if="item.message" class="text-warn" data-export-message>{{ item.message }}</span>
+        <span v-if="ui.error" class="text-warn">{{ ui.error.message }}</span>
+        <button
+          v-if="item.phase === 'streaming'"
+          type="button"
+          class="btn ml-auto"
+          :data-export-cancel="item.exportId"
+          :aria-label="t('export.cancelAction')"
+          @click="onCancelExport(item.exportId)"
+        >
+          {{ t('common.cancel') }}
+        </button>
+        <button
+          v-else
+          type="button"
+          class="btn ml-auto"
+          :data-export-dismiss="item.exportId"
+          @click="exportStore.dismiss(item.exportId)"
+        >
+          {{ t('export.dismiss') }}
+        </button>
+      </div>
     </div>
 
     <div
@@ -589,7 +938,7 @@ function onGoToRow(): void {
       <span class="text-muted">{{ bench.measureTextCalls.toLocaleString() }} measureText</span>
     </div>
 
-    <div class="flex min-h-0 flex-1">
+    <div class="relative flex min-h-0 flex-1">
       <SchemaTree
         class="w-72 shrink-0"
         data-sidebar-tree
@@ -603,6 +952,7 @@ function onGoToRow(): void {
           v-if="activeSource !== null"
           :key="gridKey"
           :source="activeSource"
+          :theme="ui.gridTheme"
           :frozen-column-count="frozen"
           :label="gridLabel"
           @ready="onReady"
@@ -624,6 +974,34 @@ function onGoToRow(): void {
         :error="detailErrorText"
         @copy-ddl="onCopyDdl"
       />
+
+      <!--
+        An overlay, not a fourth column: the window already carries the tree and
+        the detail pane, and history is opened, used once, and closed. Mounted only
+        while open so its rows cost nothing otherwise.
+      -->
+      <HistoryPanel
+        v-if="history.open"
+        class="history-overlay"
+        @load="onLoadFromHistory"
+        @notice="notice = $event"
+      />
+
+      <ExportDialog
+        v-if="ui.exportOpen"
+        class="dialog-overlay"
+        :result-id="liveResultId"
+        :insert-target="exportInsertTarget"
+        @close="ui.closeExport()"
+        @notice="notice = $event"
+      />
+
+      <CommandPalette
+        v-if="ui.paletteOpen"
+        class="palette-overlay"
+        :commands="commands"
+        @close="ui.closePalette()"
+      />
     </div>
 
     <footer
@@ -641,6 +1019,38 @@ function onGoToRow(): void {
 </template>
 
 <style scoped>
+.history-overlay {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(46rem, calc(100% - 2rem));
+  z-index: 30;
+}
+.dialog-overlay {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(40rem, calc(100% - 2rem));
+  max-height: calc(100% - 1rem);
+  z-index: 31;
+}
+/*
+ * Anchored to the top rather than centred: a palette that covers the middle of the
+ * window hides the thing the user was about to act on, and every command in it is
+ * about that thing.
+ */
+.palette-overlay {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(38rem, calc(100% - 2rem));
+  height: min(28rem, calc(100% - 1rem));
+  z-index: 32;
+}
 .btn {
   border: 1px solid var(--color-line);
   border-radius: 4px;

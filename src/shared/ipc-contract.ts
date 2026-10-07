@@ -6,6 +6,8 @@
  */
 
 import type { Result } from './errors';
+import type { ExportFormat, ExportOptions } from './export';
+import type { HistoryEntry, HistoryStatus, ParsedHistory } from './history';
 import type {
   ColumnMeta,
   ConnectionSummary,
@@ -43,16 +45,27 @@ export const IpcChannel = {
   queryRun: 'query:run',
   queryCancel: 'query:cancel',
 
+  // query history (Phase 7)
+  historyList: 'history:list',
+  historyAdd: 'history:add',
+  historyDelete: 'history:delete',
+  historyClear: 'history:clear',
+
   // results
   resultMeta: 'result:meta',
   resultWindow: 'result:window',
   resultSort: 'result:sort',
   resultDispose: 'result:dispose',
 
+  // export (Phase 8)
+  exportStart: 'export:start',
+  exportCancel: 'export:cancel',
+
   // main → renderer events
   evQueryProgress: 'event:query-progress',
   evConnectionLost: 'event:connection-lost',
   evResultEvicted: 'event:result-evicted',
+  evExportProgress: 'event:export-progress',
 } as const;
 
 export type IpcChannelValue = (typeof IpcChannel)[keyof typeof IpcChannel];
@@ -108,7 +121,82 @@ export interface ResultSortRequest {
   readonly sort: SortSpec | null;
 }
 
+/**
+ * One run, recorded by the renderer because only the renderer knows what the user
+ * typed — main sees a normalised single statement, and would otherwise file the
+ * `explain (format text) …` wrapper it adds itself as a query the user wrote.
+ *
+ * `id` and `ranAt` are absent on purpose: main generates both, so there is one
+ * clock and one id space.
+ */
+export interface HistoryAddRequest {
+  readonly sql: string;
+  readonly connectionId: string;
+  readonly connectionLabel: string;
+  readonly status: HistoryStatus;
+  readonly elapsedMs: number;
+  readonly rowCount: number;
+}
+
 // ── Responses ────────────────────────────────────────────────────────────────
+
+/**
+ * The parsed log, plus anything the store wants the user to know about it.
+ *
+ * `warning` is how a failed write becomes visible: `add` deliberately does not
+ * fail the query it describes, so this is the only channel that can carry it.
+ */
+export interface HistoryListResponse extends ParsedHistory {
+  readonly warning: string | null;
+}
+
+/**
+ * A request to export one live result (PLAN Phase 8).
+ *
+ * **There is no path field, and that is the security design.** The destination is
+ * chosen by `dialog.showSaveDialog` in the main process, so the only way a file
+ * gets written is through a picker the user just confirmed. Accepting a path from
+ * the renderer would let a compromised one write anywhere the user's account can,
+ * which is a strictly worse posture than the one `safeStorage` gives passwords.
+ *
+ * The `sql` export target is derived in main too, from the result's own browse
+ * target when it has one — see `ExportStartResponse.insertTarget`.
+ */
+export interface ExportStartRequest {
+  readonly resultId: string;
+  readonly options: ExportOptions;
+}
+
+export interface ExportStartResponse {
+  readonly exportId: string;
+  /** The path the user picked in the save dialog. */
+  readonly path: string;
+  readonly fileName: string;
+  readonly format: ExportFormat;
+  /**
+   * The quoted `INSERT` target main derived, or null when the result is not a
+   * plain table scan and the default placeholder was used. Echoed so the dialog
+   * can show what a `.sql` file will say before the user runs it.
+   */
+  readonly insertTarget: string | null;
+}
+
+/**
+ * Export progress and terminal states.
+ *
+ * `rowsWritten` and `bytesWritten` are what main has flushed, not what the server
+ * has produced, so the number on screen is never ahead of the file.
+ */
+export interface ExportProgressEvent {
+  readonly exportId: string;
+  readonly path: string;
+  readonly phase: 'streaming' | 'done' | 'cancelled' | 'failed';
+  readonly rowsWritten: number;
+  readonly bytesWritten: number;
+  readonly elapsedMs: number;
+  /** Non-null for `failed`, and the reason a cancel or a failure left a partial file. */
+  readonly message: string | null;
+}
 
 /**
  * What the renderer may see of the persisted settings. Secret material is
@@ -159,6 +247,7 @@ export interface MainEventMap {
   [IpcChannel.evQueryProgress]: QueryProgressEvent;
   [IpcChannel.evConnectionLost]: ConnectionLostEvent;
   [IpcChannel.evResultEvicted]: ResultEvictedEvent;
+  [IpcChannel.evExportProgress]: ExportProgressEvent;
 }
 
 export type MainEventChannel = keyof MainEventMap;
@@ -203,6 +292,20 @@ export interface DatabaseApi {
 
   queryRun(req: QueryRunRequest): Promise<Result<QueryRunResponse>>;
   queryCancel(resultId: string): Promise<Result<void>>;
+
+  /**
+   * Query history (PLAN Phase 7). Newest first, across the live JSONL file and
+   * every rotation still on disk, capped at `limit`.
+   *
+   * `historyClear` returns the number of records removed rather than `void`, so
+   * the UI can say what it just did — the privacy note makes this a destructive
+   * action, and a destructive action that reports nothing reads like a no-op.
+   */
+  historyList(limit?: number): Promise<Result<HistoryListResponse>>;
+  historyAdd(req: HistoryAddRequest): Promise<Result<HistoryEntry>>;
+  historyDelete(historyId: string): Promise<Result<void>>;
+  historyClear(): Promise<Result<number>>;
+
   /**
    * Current metadata for a result. How the renderer learns that the exact row
    * count has replaced the `reltuples` estimate, since the count runs in the
@@ -216,6 +319,24 @@ export interface DatabaseApi {
   resultWindow(req: ResultWindowRequest): Promise<Result<EncodedRowBlock>>;
   resultSort(req: ResultSortRequest): Promise<Result<ResultMeta>>;
   resultDispose(resultId: string): Promise<Result<void>>;
+
+  /**
+   * Starts an export of one live result (PLAN Phase 8).
+   *
+   * Main opens the save dialog itself and streams straight to disk, so **rows
+   * never cross the bridge** — that is what keeps a million-row export inside the
+   * renderer's memory budget instead of blowing it. Resolves once the user has
+   * answered the dialog and the stream has started, not when it finishes; progress
+   * and the terminal state arrive on `onExportProgress`.
+   *
+   * `null` means the user dismissed the save dialog, which is not an error.
+   */
+  exportStart(req: ExportStartRequest): Promise<Result<ExportStartResponse | null>>;
+  /**
+   * Stops an export at its next batch boundary and signals the backend, so a fetch
+   * that is itself slow does not have to finish first.
+   */
+  exportCancel(exportId: string): Promise<Result<void>>;
 }
 
 export type { ColumnMeta };

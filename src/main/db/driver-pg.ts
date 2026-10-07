@@ -155,22 +155,66 @@ class PgSessionImpl implements PgSession {
 
   async acquire(): Promise<PgClientHandle> {
     const client = await this.pool.connect();
+    let released = false;
+    /** Set when the server closes this backend out from under us. */
+    let broken: Error | null = null;
+
+    const release = (error?: Error): void => {
+      // Releasing twice corrupts the pool's free list, and a cursor is closed on
+      // both the disposal path and the eviction path — and now also by the error
+      // handler below, which can win the race against either.
+      if (released) return;
+      released = true;
+      try {
+        client.release(error);
+      } catch (caught) {
+        logError(`${SCOPE}:release`, caught);
+      }
+    };
+
+    /**
+     * A checked-out client is **not** covered by the pool's own `error` handler —
+     * `pg` emits that only for idle clients. Without this listener an `error` on a
+     * live client is an unhandled EventEmitter error, which Node rethrows as an
+     * uncaught exception and the entire app dies.
+     *
+     * The trigger is not exotic: `idle_in_transaction_session_timeout` is 60s, and
+     * a result tab holds a `REPEATABLE READ` transaction open for as long as the
+     * user leaves it on screen. Leave a query result sitting for a minute and the
+     * server terminates the backend — an ordinary, documented event that used to be
+     * fatal. Found by the smoke harness, which hung instead of reporting until it
+     * was given crash handlers; the crash was the app's, not the harness's.
+     *
+     * The slot is given back rather than held: the backend is gone, so keeping the
+     * client checked out would leak one of the pool's few slots permanently.
+     */
+    client.on('error', (error: Error) => {
+      broken = error;
+      logError(`${SCOPE}:client`, error);
+      release(error);
+    });
+
     // The pid identifies the backend running *this* client's query, which is what
     // `pg_cancel_backend` needs. Reading it once at acquire time is one round trip
     // per cursor, not one per fetch.
-    const pid = Number(await readScalar(client, 'select pg_backend_pid()'));
-    let released = false;
+    let pid: number;
+    try {
+      pid = Number(await readScalar(client, 'select pg_backend_pid()'));
+    } catch (error) {
+      release(error instanceof Error ? error : undefined);
+      throw error;
+    }
 
     return {
       backendPid: Number.isFinite(pid) ? pid : 0,
-      query: (text, values) => run(client, text, values),
-      release: () => {
-        // Releasing twice corrupts the pool's free list, and a cursor is closed on
-        // both the disposal path and the eviction path.
-        if (released) return;
-        released = true;
-        client.release();
+      query: (text, values) => {
+        const failure = broken;
+        // Fail fast rather than queue onto a socket the server has already closed,
+        // which would otherwise hang until the pool's own timeout noticed.
+        if (failure !== null) return Promise.reject(failure);
+        return run(client, text, values);
       },
+      release: () => release(),
     };
   }
 

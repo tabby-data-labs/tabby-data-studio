@@ -4,13 +4,20 @@ import { IpcChannel, type SettingsSnapshot } from '../../shared/ipc-contract';
 import type { WindowState } from '../../shared/domain';
 import { logError, logInfo, logRejectedPayload } from '../log';
 import type { SettingsStore } from '../store/settings-store';
+import type { HistoryStore } from '../store/history-store';
 import type { ConnectionManager } from '../db/connection-manager';
 import type { QueryService } from '../db/query-service';
 import type { SchemaService } from '../db/schema-service';
+import type { ExportService } from '../export/export-service';
 import {
   ValidationError,
   validateConnSave,
   validateConnectionId,
+  validateExportId,
+  validateExportStart,
+  validateHistoryAdd,
+  validateHistoryId,
+  validateHistoryLimit,
   validateQueryRun,
   validateResultId,
   validateResultSort,
@@ -26,6 +33,8 @@ export interface RouterServices {
   readonly connections: ConnectionManager;
   readonly schemas: SchemaService;
   readonly queries: QueryService;
+  readonly history: HistoryStore;
+  readonly exports: ExportService;
 }
 
 const SCOPE = 'ipc';
@@ -145,6 +154,9 @@ export function registerIpcHandlers(services: RouterServices): () => void {
     // and `pool.end()` waits for all of them.
     const stored = services.settings.deleteConnection(connectionId);
     if (stored.ok) {
+      // An export holds a client for its whole life and would otherwise make
+      // `close()` wait out a multi-million-row write for a connection being deleted.
+      await services.exports.dropConnection(connectionId);
       services.queries.dropConnection(connectionId);
       await services.queries.drain();
       services.schemas.dropConnection(connectionId);
@@ -165,6 +177,7 @@ export function registerIpcHandlers(services: RouterServices): () => void {
   });
 
   handle(IpcChannel.connClose, validateConnectionId, async (connectionId) => {
+    await services.exports.dropConnection(connectionId);
     services.queries.dropConnection(connectionId);
     // Await the cursor releases before ending the pool, or `pool.end()` sits waiting
     // for clients that are still mid-ROLLBACK.
@@ -201,6 +214,39 @@ export function registerIpcHandlers(services: RouterServices): () => void {
 
   handle(IpcChannel.resultDispose, validateResultId, (resultId) =>
     services.queries.dispose(resultId),
+  );
+
+  // ── Query history ──────────────────────────────────────────────────────────
+  //
+  // These handlers are thin on purpose: the retention rules and the file format
+  // live in `shared/history` and `store/history-store`, so the behaviour the
+  // renderer sees is the behaviour the unit tests cover. What the router adds is
+  // the boundary — validation in, and a log line for the one destructive action.
+  handle(IpcChannel.historyList, validateHistoryLimit, (limit) => ok(services.history.list(limit)));
+
+  handle(IpcChannel.historyAdd, validateHistoryAdd, (request) => services.history.add(request));
+
+  handle(IpcChannel.historyDelete, validateHistoryId, (historyId) =>
+    services.history.delete(historyId),
+  );
+
+  handle(
+    IpcChannel.historyClear,
+    () => undefined,
+    () => {
+      const cleared = services.history.clear();
+      // The count, never the contents: PLAN's privacy note is the reason this
+      // channel exists, and logging what it deleted would defeat it.
+      if (cleared.ok) logInfo(SCOPE, `cleared ${cleared.value} query history entries`);
+      return cleared;
+    },
+  );
+
+  // ── Export ─────────────────────────────────────────────────────────────────
+  handle(IpcChannel.exportStart, validateExportStart, (request) => services.exports.start(request));
+
+  handle(IpcChannel.exportCancel, validateExportId, (exportId) =>
+    services.exports.cancel(exportId),
   );
 
   logInfo(SCOPE, `registered ${registered.length} channels`);

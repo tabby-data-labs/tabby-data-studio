@@ -15,11 +15,16 @@
  * machine with no database configured skips rather than fails.
  */
 import { env, hrtime } from 'node:process';
+import { mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { StoredConnection } from '../../../src/shared/domain';
+import type { MainEventEmitter } from '../../../src/shared/ipc-contract';
 import { ConnectionManager } from '../../../src/main/db/connection-manager';
 import { createPgDriver } from '../../../src/main/db/driver-pg';
 import { QueryService, type ResultLimits } from '../../../src/main/db/query-service';
 import { SchemaService } from '../../../src/main/db/schema-service';
+import { ExportService } from '../../../src/main/export/export-service';
 
 export interface PgTestConfig {
   readonly host: string;
@@ -73,6 +78,9 @@ export interface Harness {
   readonly connections: ConnectionManager;
   readonly schemas: SchemaService;
   readonly queries: QueryService;
+  readonly exports: ExportService;
+  /** Where `pickPath` puts an export, so a spec can read the file back. */
+  readonly exportDir: string;
   /** Events main would push to the renderer, captured for assertions. */
   readonly events: { channel: string; payload: unknown }[];
   dispose(): Promise<void>;
@@ -81,11 +89,19 @@ export interface Harness {
 export interface HarnessOptions {
   /** Tight registry bounds, for the memory-cap soak. */
   readonly limits?: ResultLimits;
+  /**
+   * Where an export writes. Defaults to a throwaway directory under the system
+   * temp, so a spec can read the file back without naming a path of its own.
+   */
+  readonly exportDir?: string;
 }
 
 export function createHarness(options: HarnessOptions = {}): Harness {
   const stored = storedConnection();
   const events: { channel: string; payload: unknown }[] = [];
+  const emit = ((channel: string, payload: unknown) => {
+    events.push({ channel, payload });
+  }) as unknown as MainEventEmitter;
 
   const connections = new ConnectionManager({
     driver: createPgDriver(),
@@ -95,20 +111,34 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     secretFor: () => config?.password ?? null,
   });
 
+  const exportDir = options.exportDir ?? join(tmpdir(), `tabby-export-${hrtime.bigint()}`);
+  mkdirSync(exportDir, { recursive: true });
+
   const schemas = new SchemaService({ connections });
   const queries = new QueryService({
     connections,
     schemas,
-    emit: (channel, payload) => events.push({ channel, payload }),
+    emit,
     limits: options.limits,
+  });
+  const exports = new ExportService({
+    connections,
+    queries,
+    emit,
+    // Stands in for `dialog.showSaveDialog`, which cannot be driven headlessly.
+    // The suggested name is honoured so a spec can predict the path.
+    pickPath: async (suggested) => join(exportDir, suggested),
   });
 
   return {
     connections,
     schemas,
     queries,
+    exports,
     events,
+    exportDir,
     dispose: async () => {
+      await exports.cancelAll();
       schemas.dropConnection(CONNECTION_ID);
       await connections.closeAll();
     },

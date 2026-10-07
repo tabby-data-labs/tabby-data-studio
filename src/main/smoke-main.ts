@@ -10,7 +10,7 @@
  * Exits non-zero on any failed assertion or unexpected console error.
  */
 import { app, BrowserWindow, clipboard } from 'electron';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -18,14 +18,32 @@ import { applySecurityGuards, type CspProfile } from './security/navigation';
 import { registerIpcHandlers } from './ipc/router';
 import { createDbServices } from './db/services';
 import { SettingsStore } from './store/settings-store';
+import { HistoryStore } from './store/history-store';
 import type { SecretCipher } from './store/cipher';
 
 const defaultUrl = pathToFileURL(join(__dirname, '../renderer/index.html')).href;
 const target = process.env['TABBY_SMOKE_URL'] ?? defaultUrl;
 const profile: CspProfile = process.env['TABBY_SMOKE_CSP'] === 'dev' ? 'dev' : 'prod';
 
-/** Hard ceiling so a stalled renderer fails the harness instead of hanging CI. */
-const WATCHDOG_MS = 90_000;
+/**
+ * Whether the live sections run, decided once at module scope.
+ *
+ * Read here rather than further down because the watchdog budget depends on it, and
+ * the watchdog is installed before the rest of the harness has worked that out.
+ */
+const LIVE_CONFIGURED =
+  (process.env['TABBY_TEST_PG_USER'] ?? '') !== '' &&
+  (process.env['TABBY_TEST_PG_DATABASE'] ?? '') !== '';
+
+/**
+ * Hard ceiling so a stalled renderer fails the harness instead of hanging CI.
+ *
+ * Longer with a database: the live sections run real queries, a 200k-row export and
+ * a cancelled 10M-row export against the server, and none of those has a fixed cost
+ * on a shared runner. The database-free budget stays tight, because that is the run
+ * CI performs on every commit and a stall there should be loud rather than patient.
+ */
+const WATCHDOG_MS = LIVE_CONFIGURED ? 300_000 : 90_000;
 
 const problems: string[] = [];
 const cspEnforcement: string[] = [];
@@ -53,6 +71,25 @@ function classifyConsole(message: string): void {
   problems.push(message.slice(0, 300));
 }
 
+/**
+ * Turn a crash into output.
+ *
+ * Without these, a rejection inside the harness — a `null.querySelector` because an
+ * element was missing, say — leaves Electron running with no window logic left to
+ * exit, and the run produces *nothing*: no JSON, no failure, just a process that
+ * sits until something external kills it. That is the worst possible outcome for a
+ * harness whose whole job is to report. Found by watching a live run do exactly
+ * that for ten minutes.
+ */
+function die(kind: string, error: unknown): void {
+  const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  process.stdout.write(`${JSON.stringify({ fatal: kind, message: message.slice(0, 2000) })}\n`);
+  app.exit(1);
+}
+
+process.on('unhandledRejection', (reason: unknown) => die('unhandledRejection', reason));
+process.on('uncaughtException', (error: unknown) => die('uncaughtException', error));
+
 app
   .whenReady()
   .then(async () => {
@@ -67,6 +104,18 @@ app
       decrypt: (ct) => Buffer.from(ct.slice(4, -1), 'base64').toString('utf8'),
     };
     const settings = new SettingsStore({ dir: settingsDir, cipher });
+    const historyStore = new HistoryStore({ dir: join(settingsDir, 'history') });
+    const exportDir = join(settingsDir, 'exports');
+    mkdirSync(exportDir, { recursive: true });
+    /**
+     * Every destination the fake picker handed out, in order.
+     *
+     * Recorded rather than guessed from the file name: two exports in one run both
+     * suggest `export.csv`, and a collision would make the second silently overwrite
+     * the first — after which "the file has the right number of rows" would be an
+     * assertion about whichever export happened to land last.
+     */
+    const exportedPaths: string[] = [];
 
     // Watchdog: a stalled executeJavaScript must fail loudly, not hang CI forever.
     const watchdog = setTimeout(() => {
@@ -133,6 +182,15 @@ app
     // harness match production instead of a simpler thing that passes.
     const db = createDbServices({
       settings,
+      // No native dialog can be driven headlessly, so the harness supplies the
+      // destination itself. It stays inside the throwaway settings dir, which means
+      // the export assertions can read the bytes back — the same non-circular trick
+      // the settings ciphertext check uses.
+      pickPath: async (suggested) => {
+        const path = join(exportDir, `${exportedPaths.length}-${suggested}`);
+        exportedPaths.push(path);
+        return path;
+      },
       emit: (channel, payload) => {
         if (!win.isDestroyed()) win.webContents.send(channel, payload);
       },
@@ -143,6 +201,8 @@ app
       connections: db.connections,
       schemas: db.schemas,
       queries: db.queries,
+      history: historyStore,
+      exports: db.exports,
     });
 
     await win.loadURL(target);
@@ -437,6 +497,313 @@ app
     return out;
   })()`)) as Record<string, unknown>;
 
+    // ── Query history (Phase 7) ──────────────────────────────────────────────
+    // Drives the real bridge and the real panel: record, list, delete, filter,
+    // restore into the editor, and refuse five hostile payloads.
+    //
+    // It deliberately leaves its records on disk. Main then reads the JSONL file
+    // itself, which is the only non-circular proof that the log is real bytes in a
+    // real directory — a renderer cannot attest to its own persistence — and the
+    // follow-up `historyClear` block proves "clear history" removes those bytes
+    // rather than hiding them. PLAN's privacy note asks for exactly that action.
+    const history = (await win.webContents.executeJavaScript(`(async () => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const out = {};
+    const db = window.tabby && window.tabby.db;
+    out.hasBridge = !!db &&
+      typeof db.historyList === 'function' && typeof db.historyAdd === 'function' &&
+      typeof db.historyDelete === 'function' && typeof db.historyClear === 'function';
+    if (!db) return out;
+
+    await db.historyClear();
+
+    const record = (sql, status) => db.historyAdd({
+      sql,
+      connectionId: 'smoke-1',
+      connectionLabel: 'Smoke · db.internal:5432/app',
+      status,
+      elapsedMs: 7,
+      rowCount: 3,
+    });
+
+    const first = await record('select 1', 'ok');
+    out.addOk = first.ok === true;
+    // id and ranAt are main's to generate; a renderer that could supply them could
+    // backdate or collide records.
+    out.addCarriesMainId = first.ok === true && typeof first.value.id === 'string' &&
+      first.value.id.length > 0;
+    out.addCarriesMainTimestamp = first.ok === true && Number.isFinite(first.value.ranAt);
+    out.addEchoesTheStatement = first.ok === true && first.value.sql === 'select 1';
+
+    await record('select * from fixtures.big', 'ok');
+    const failed = await record('select nope from nowhere', 'failed');
+
+    const listed = await db.historyList();
+    out.listOk = listed.ok === true;
+    out.listCount = listed.ok === true ? listed.value.entries.length : -1;
+    out.listNewestFirst = listed.ok === true &&
+      listed.value.entries[0].sql === 'select nope from nowhere';
+    out.listCarriesStatus = listed.ok === true && listed.value.entries[0].status === 'failed';
+    out.listCarriesLabel = listed.ok === true &&
+      listed.value.entries[0].connectionLabel === 'Smoke · db.internal:5432/app';
+    out.listSkippedNothing = listed.ok === true && listed.value.skipped === 0;
+
+    // The id main handed back is the one a delete names.
+    const failedId = failed.ok === true ? failed.value.id : '';
+    out.deleteOk = (await db.historyDelete(failedId)).ok === true;
+    const afterDelete = await db.historyList();
+    out.countAfterDelete = afterDelete.ok === true ? afterDelete.value.entries.length : -1;
+    out.deleteTwiceIsNotFound = (await db.historyDelete(failedId)).ok === false;
+
+    const limited = await db.historyList(1);
+    out.limitHonoured = limited.ok === true && limited.value.entries.length === 1;
+
+    // Hostile payloads. Each must be refused with a tagged error and must not have
+    // written anything, which the count after them is what proves.
+    const base = {
+      sql: 'select 1', connectionId: 'smoke-1', connectionLabel: '',
+      status: 'ok', elapsedMs: 1, rowCount: 1,
+    };
+    const nul = String.fromCharCode(0);
+    const hostile = [
+      ['a smuggled id', Object.assign({}, base, { id: 'mine' })],
+      ['a smuggled timestamp', Object.assign({}, base, { ranAt: 1 })],
+      ['a NUL in the statement', Object.assign({}, base, { sql: 'select ' + nul + '1' })],
+      ['an invented status', Object.assign({}, base, { status: 'exploded' })],
+      ['a non-object payload', 'select 1'],
+    ];
+    out.hostileRejected = 0;
+    out.hostileThrew = 0;
+    for (const [, payload] of hostile) {
+      try {
+        const result = await db.historyAdd(payload);
+        if (result.ok === false && result.error.code === 'VALIDATION_FAILED') out.hostileRejected += 1;
+      } catch {
+        out.hostileThrew += 1;
+      }
+    }
+    out.hostileTotal = hostile.length;
+    out.limitBeyondCapRefused = (await db.historyList(100000000)).ok === false;
+    const afterHostile = await db.historyList();
+    out.countUnchangedByHostile = afterHostile.ok === true && afterHostile.value.entries.length === 2;
+
+    // ── The panel, driven by the buttons a user would press ──────────────────
+    await record('select * from fixtures.wide order by id', 'ok');
+
+    const panel = () => document.querySelector('[data-history-panel]');
+    const toggle = document.querySelector('[data-history-toggle]');
+    out.togglePresent = !!toggle;
+    if (toggle) toggle.click();
+    await sleep(250);
+
+    out.panelOpened = !!panel();
+    out.panelIsDialog = !!panel() && panel().getAttribute('role') === 'dialog';
+    out.panelIsLabelled = !!panel() && panel().getAttribute('aria-label') === 'Query history';
+    out.rowsRendered = panel() ? panel().querySelectorAll('[data-history-item]').length : -1;
+    // The privacy note is rendered where the secrets are listed, not only in PLAN.
+    out.privacyNoteShown = !!panel() && panel().textContent.includes('never synced');
+
+    const search = panel() ? panel().querySelector('[data-history-search]') : null;
+    out.searchPresent = !!search;
+    if (search) {
+      search.value = 'fixtures.wide';
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(150);
+      out.filterNarrowsToOne = panel().querySelectorAll('[data-history-item]').length === 1;
+    }
+
+    // Restoring must hand the editor the statement, not the one-line preview.
+    const row = panel() ? panel().querySelector('[data-history-load]') : null;
+    out.rowFound = !!row;
+    if (row) row.click();
+    await sleep(250);
+    const area = document.querySelector('[data-sql-input]');
+    out.editorReceivedStatement = !!area &&
+      area.value === 'select * from fixtures.wide order by id';
+    out.panelClosedAfterLoad = !document.querySelector('[data-history-panel]');
+
+    // Escape closes, and takes the document listener with it.
+    if (toggle) toggle.click();
+    await sleep(200);
+    out.reopened = !!panel();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await sleep(150);
+    out.escapeClosed = !document.querySelector('[data-history-panel]');
+
+    return out;
+  })()`)) as Record<string, unknown>;
+
+    // Main reads the log back itself. A renderer cannot prove its own persistence,
+    // and this is the assertion that the file is where the privacy note says it is:
+    // inside userData, in its own directory, and nowhere else.
+    const historyDir = join(settingsDir, 'history');
+    const historyOnDisk = existsSync(historyDir)
+      ? readdirSync(historyDir).filter((name) => name.endsWith('.jsonl'))
+      : [];
+    const historyText = existsSync(join(historyDir, 'history.jsonl'))
+      ? readFileSync(join(historyDir, 'history.jsonl'), 'utf8')
+      : '';
+    const historyLines = historyText.split('\n').filter((line) => line.trim() !== '');
+    const escapedOutsideHistoryDir = readdirSync(settingsDir).filter((name) =>
+      name.endsWith('.jsonl'),
+    );
+
+    // "Clear history" through the panel, then main checks the bytes are gone. The
+    // renderer reporting an empty list would also be what a bug that merely hides
+    // the rows reports, so the filesystem is the witness.
+    const historyCleared = (await win.webContents.executeJavaScript(`(async () => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const out = {};
+    const panel = () => document.querySelector('[data-history-panel]');
+    const clearButton = () => panel() && panel().querySelector('[data-history-clear]');
+
+    const toggle = document.querySelector('[data-history-toggle]');
+    if (toggle) toggle.click();
+    await sleep(250);
+    out.reopenedWithRows = panel() ? panel().querySelectorAll('[data-history-item]').length : -1;
+    // The filter typed in the previous block must not survive the close: reopening
+    // narrowed to it would look like the log had lost entries.
+    const reopenedSearch = panel() ? panel().querySelector('[data-history-search]') : null;
+    out.filterResetOnReopen = !!reopenedSearch && reopenedSearch.value === '';
+
+    const armed = clearButton();
+    out.clearPresent = !!armed;
+    if (armed) armed.click();
+    await sleep(150);
+    // One click only arms the action: a stray click must not destroy the log.
+    out.firstClickOnlyArms =
+      !!panel() && panel().querySelectorAll('[data-history-item]').length > 0;
+    const relabelled = clearButton();
+    out.armedLabelChanged = !!relabelled && relabelled.textContent.includes('Click again');
+
+    const confirmed = clearButton();
+    if (confirmed) confirmed.click();
+    await sleep(300);
+    out.emptyStateShown = !!panel() && !!panel().querySelector('[data-history-empty]');
+
+    const listed = await window.tabby.db.historyList();
+    out.countAfterClear = listed.ok === true ? listed.value.entries.length : -1;
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await sleep(120);
+    out.closedAtEnd = !document.querySelector('[data-history-panel]');
+    return out;
+  })()`)) as Record<string, unknown>;
+
+    const historyFilesAfterClear = existsSync(historyDir)
+      ? readdirSync(historyDir).filter((name) => name.endsWith('.jsonl'))
+      : [];
+
+    // ── Command palette and theme (Phase 8) ──────────────────────────────────
+    // Database-free on purpose: neither needs a result, and a check that only runs
+    // when TABBY_TEST_PG_* is set is a check CI never performs.
+    //
+    // The palette query is untrusted keystroke-by-keystroke input fed to a matcher,
+    // so the regex-metacharacter case is asserted here rather than assumed: a
+    // matcher that built a RegExp from the query would hang the renderer, and a
+    // hung renderer is a watchdog kill that looks like an unrelated timeout.
+    const chrome = (await win.webContents.executeJavaScript(`(async () => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const out = {};
+    const root = document.documentElement;
+    const palette = () => document.querySelector('[data-command-palette]');
+    const rows = () => palette() ? palette().querySelectorAll('[data-palette-row]') : [];
+
+    // ── theme ────────────────────────────────────────────────────────────────
+    out.themeBefore = root.dataset.theme || 'dark';
+    // Computed style, not the attribute: setting \`data-theme\` proves the store ran,
+    // and nothing more. The CSS block could have been shaken out of the bundle by
+    // Tailwind and the attribute would still flip, leaving a UI that says "light"
+    // while every surface stays dark.
+    const background = () => getComputedStyle(document.body).backgroundColor;
+    out.backgroundBefore = background();
+    const themeButton = document.querySelector('[data-theme-toggle]');
+    out.themeTogglePresent = !!themeButton;
+    themeButton.click();
+    await sleep(250);
+    out.themeAfter = root.dataset.theme;
+    out.themeFlipped = out.themeAfter !== out.themeBefore;
+    out.backgroundAfter = background();
+    out.themeActuallyRepainted = out.backgroundBefore !== out.backgroundAfter;
+    const settings = await window.tabby.db.getSettings();
+    out.themePersisted = settings.ok ? settings.value.theme : null;
+    out.themeMatchesSetting = out.themePersisted === out.themeAfter;
+    themeButton.click();
+    await sleep(250);
+    out.themeRestored = root.dataset.theme === out.themeBefore;
+    out.backgroundRestored = background() === out.backgroundBefore;
+
+    // ── palette ──────────────────────────────────────────────────────────────
+    const openButton = document.querySelector('[data-palette-open]');
+    out.paletteButtonPresent = !!openButton;
+    out.exportDisabledWithNoResult =
+      document.querySelector('[data-export-open]').disabled === true;
+    openButton.click();
+    await sleep(250);
+    out.paletteOpened = !!palette();
+    out.paletteIsDialog = !!palette() && palette().getAttribute('role') === 'dialog';
+    out.paletteHasInput = !!palette() && !!palette().querySelector('[data-palette-input]');
+    out.paletteListsCommands = rows().length;
+    // The filtering property, and the one worth pinning: a command that cannot run
+    // is not listed at all. A palette full of inert rows teaches the user that it
+    // lies, which is worse than a short list.
+    out.noQueryCommandWithoutConnection =
+      !Array.from(rows()).some((r) => /Run statement|Run all|Explain/.test(r.textContent));
+    out.noResultCommandWithoutResult =
+      !Array.from(rows()).some((r) => /Export result|Copy selection/.test(r.textContent));
+
+    const input = palette().querySelector('[data-palette-input]');
+    const type = async (text) => {
+      input.value = text;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(200);
+    };
+
+    // 'thm' is not a substring of 'Theme', so this only passes on a subsequence
+    // match — the property that makes a palette usable at typing speed.
+    await type('thm');
+    out.fuzzyMatched = rows().length > 0;
+    out.fuzzyTopIsTheme = rows().length > 0 && /Theme/.test(rows()[0].textContent);
+    out.matchedLettersHighlighted = !!palette().querySelector('mark.hit');
+
+    await type('zzzzqqq');
+    out.noMatchSaysSo = !!palette().querySelector('[data-palette-empty]');
+
+    await type('(((((((((a');
+    out.metacharacterQuerySurvived = !!palette();
+
+    // Enter runs the top command. With no connection open the only Query command
+    // is history, so the observable effect is the history panel appearing.
+    await type('hist');
+    const historyFirst = rows().length > 0 && /Query history/.test(rows()[0].textContent);
+    out.enterRunsTopCommand = false;
+    if (historyFirst) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await sleep(300);
+      out.enterRunsTopCommand =
+        !document.querySelector('[data-command-palette]') &&
+        !!document.querySelector('[data-history-panel]');
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await sleep(200);
+    }
+    out.historyClosedAgain = !document.querySelector('[data-history-panel]');
+
+    // Escape closes, and ⌘K reopens from anywhere in the document.
+    openButton.click();
+    await sleep(200);
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await sleep(200);
+    out.escapeClosedPalette = !palette();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }));
+    await sleep(250);
+    out.cmdKReopened = !!palette();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await sleep(200);
+    out.closedAtEnd = !palette();
+
+    return out;
+  })()`)) as Record<string, unknown>;
+
     // ── IPC round-trip ─────────────────────────────────────────────────────────
     // Exercises the production path end to end: renderer -> contextBridge ->
     // ipcMain -> validator -> SettingsStore -> Result back. Also proves a hostile
@@ -562,7 +929,7 @@ app
      */
     const pgUser = process.env['TABBY_TEST_PG_USER'] ?? '';
     const pgDatabase = process.env['TABBY_TEST_PG_DATABASE'] ?? '';
-    const liveConfigured = pgUser !== '' && pgDatabase !== '';
+    const liveConfigured = LIVE_CONFIGURED;
 
     /**
      * Phase 7's second exit criterion, from the UI: **cancelling a runaway query**.
@@ -670,6 +1037,239 @@ app
     })()`)) as Record<string, unknown>;
         })()
       : null;
+
+    /**
+     * Phase 8's exit criterion, from the UI: **a streamed export, and a cancel
+     * mid-flight**.
+     *
+     * `tests/integration/pg-export.spec.ts` proves the same thing about main — a
+     * million rows, a flat retained heap, a partial file kept on cancel. What only
+     * this block can prove is the half the criterion actually names: that the
+     * *renderer* stays flat while it happens, because renderer memory is only
+     * observable from inside the renderer. `performance.memory` is sampled before
+     * and after, and the rows are counted from main, off disk.
+     *
+     * It also asserts the security property the design rests on: a `path` smuggled
+     * into `exportStart` is refused by the validator, and nothing appears at it.
+     */
+    const uiExport = liveConfigured
+      ? await (async (): Promise<Record<string, unknown>> => {
+          await win.webContents.executeJavaScript(`(async () => {
+      const db = window.tabby.db;
+      await db.saveConnection({
+        connection: {
+          id: 'smoke-export',
+          name: 'smoke export',
+          host: ${JSON.stringify(process.env['TABBY_TEST_PG_HOST'] ?? 'localhost')},
+          port: ${JSON.stringify(Number(process.env['TABBY_TEST_PG_PORT'] ?? 5432))},
+          database: ${JSON.stringify(pgDatabase)},
+          user: ${JSON.stringify(pgUser)},
+          sslMode: 'disable',
+          createdAt: 0,
+          updatedAt: 0,
+        },
+        password: ${JSON.stringify(process.env['TABBY_TEST_PG_PASSWORD'] ?? '')},
+      });
+    })()`);
+
+          const reloadedForExport = new Promise<void>((resolve) => {
+            win.webContents.once('did-finish-load', () => resolve());
+          });
+          win.webContents.reload();
+          await reloadedForExport;
+          await wait(1_500);
+
+          return (await win.webContents.executeJavaScript(`(async () => {
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const out = { error: null, stage: 'start' };
+      const db = window.tabby.db;
+      // A hard budget for this block alone. Without it, one wait that never ends
+      // takes the whole harness with it and the run reports nothing at all — which
+      // is how the crash in driver-pg.ts stayed invisible for a full run.
+      const blockDeadline = Date.now() + 150000;
+      const expired = () => Date.now() > blockDeadline;
+      const heap = () => (performance.memory ? performance.memory.usedJSHeapSize : -1);
+      const byText = (label) =>
+        Array.from(document.querySelectorAll('button')).find((b) => b.textContent.trim() === label);
+      const dialog = () => document.querySelector('[data-export-dialog]');
+      const trayRows = () => document.querySelectorAll('[data-export-tray] [data-export-row]');
+      const lastRow = () => { const all = trayRows(); return all[all.length - 1]; };
+      const phaseOf = (row) => row ? row.querySelector('[data-export-phase]').textContent : '';
+
+      out.stage = 'pick-connection';
+      const select = document.querySelector('select');
+      if (!select) { out.error = 'no connection picker after reload'; return out; }
+      select.value = 'smoke-export';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(100);
+      const openConnection = byText('Open');
+      if (!openConnection) { out.error = 'no Open button'; return out; }
+      openConnection.click();
+      await sleep(1500);
+
+      // ── The security property: no path can be smuggled in ─────────────────
+      out.stage = 'smuggled-path';
+      const options = {
+        format: 'csv', delimiter: ',', includeHeader: true, nullText: '',
+        encoding: 'utf8', lineEnding: 'crlf', writeBom: true, rowsPerInsert: 100,
+      };
+      const smuggled = await db.exportStart({
+        resultId: 'does-not-exist', path: '/tmp/tabby-smuggled.csv', options,
+      });
+      out.pathRefusedByValidator =
+        smuggled.ok === false && smuggled.error.code === 'VALIDATION_FAILED';
+      const unknown = await db.exportStart({ resultId: 'nope', options });
+      out.unknownResultRefused = unknown.ok === false;
+
+      // ── A real result, exported through the buttons ───────────────────────
+      out.stage = 'run-query';
+      const pane = document.querySelector('[data-query-editor]');
+      const area = document.querySelector('[data-sql-input]');
+      if (!pane || !area) { out.error = 'no editor'; return out; }
+      area.value = 'select * from fixtures.big limit 200000';
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(150);
+      pane.querySelector('[data-run]').click();
+
+      const tabs = () => document.querySelectorAll('[role="tab"]').length;
+      while (!expired() && tabs() < 2) await sleep(100);
+      out.resultOpened = tabs() >= 2;
+      out.tabsSeen = tabs();
+      if (!out.resultOpened) { out.error = 'the query never produced a tab'; return out; }
+
+      out.stage = 'open-dialog';
+      const dialogButton = document.querySelector('[data-export-open]');
+      out.exportEnabledWithResult = dialogButton.disabled === false;
+      dialogButton.click();
+      await sleep(300);
+
+      out.dialogOpened = !!dialog();
+      if (!out.dialogOpened) { out.error = 'the export dialog never opened'; return out; }
+      out.stage = 'dialog-shape';
+      out.dialogIsDialog = dialog().getAttribute('role') === 'dialog';
+      out.fourFormats = dialog().querySelectorAll('[data-export-format]').length;
+      // There is no destination field at all: the picker belongs to main, and a
+      // renderer that could type a path could write anywhere the user can.
+      out.noPathField =
+        dialog().querySelector('input[type="file"]') === null &&
+        !/save as/i.test(dialog().querySelector('.body').textContent || '');
+      out.dialogSaysRowsBypassTheRenderer =
+        /none pass through this window/.test(dialog().textContent || '');
+
+      out.stage = 'export-200k';
+      const heapBefore = heap();
+      const startButton = dialog().querySelector('[data-export-start]');
+      // Captured because a disabled button swallows a click silently: without this,
+      // "nothing happened" and "the click was refused" are indistinguishable.
+      out.startButtonDisabled = startButton.disabled === true;
+      startButton.click();
+      await sleep(400);
+      const problem = dialog() ? dialog().querySelector('[data-export-problem]') : null;
+      const dialogError = dialog() ? dialog().querySelector('[data-export-error]') : null;
+      out.dialogProblem = problem ? problem.textContent.trim() : null;
+      out.dialogError = dialogError ? dialogError.textContent.trim() : null;
+
+      out.trayAppeared = false;
+      const doneDeadline = Date.now() + 45000;
+      while (!expired() && Date.now() < doneDeadline) {
+        if (phaseOf(lastRow()) === 'done') { out.trayAppeared = true; break; }
+        await sleep(100);
+      }
+      out.exportReachedDone = phaseOf(lastRow()) === 'done';
+      out.exportPhaseSeen = phaseOf(lastRow());
+      out.exportSummary = lastRow() ? lastRow().querySelector('[data-export-summary]').textContent : '';
+      out.cancelReplacedByDismiss = !!lastRow() &&
+        lastRow().querySelector('[data-export-cancel]') === null &&
+        lastRow().querySelector('[data-export-dismiss]') !== null;
+
+      // Chromium quantizes this without --enable-precise-memory-info, so it is a
+      // magnitude and not a byte count. 200k rows of four columns is ~7MB of text;
+      // a renderer that received them would show tens of megabytes, and one that
+      // built a string of the whole file would show more.
+      const heapAfter = heap();
+      out.rendererHeapBeforeMB = Math.round(heapBefore / 1e6);
+      out.rendererHeapAfterMB = Math.round(heapAfter / 1e6);
+      out.rendererHeapDeltaMB = Math.round((heapAfter - heapBefore) / 1e6);
+      if (!out.exportReachedDone) {
+        out.error = 'the 200k export never reached done';
+        return out;
+      }
+      if (expired()) { out.error = 'ran out of time during the 200k export'; return out; }
+
+      // ── Cancel mid-flight ─────────────────────────────────────────────────
+      out.stage = 'run-big-query';
+      area.value = 'select * from fixtures.big limit 3000000';
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(150);
+      pane.querySelector('[data-run]').click();
+      while (!expired() && tabs() < 3) await sleep(100);
+      out.secondResultOpened = tabs() >= 3;
+      if (!out.secondResultOpened) { out.error = 'the second query never produced a tab'; return out; }
+
+      out.stage = 'cancel-export';
+      dialogButton.click();
+      await sleep(300);
+      dialog().querySelector('[data-export-start]').click();
+
+      // Wait for rows to have been written, so "cancelled mid-flight" means that
+      // rather than "cancelled before it started" — which every later assertion
+      // would also pass on.
+      let sawProgress = false;
+      while (!expired()) {
+        const text = lastRow() ? lastRow().textContent : '';
+        if (/rows written/.test(text) && !/\\b0 rows written/.test(text)) { sawProgress = true; break; }
+        await sleep(100);
+      }
+      out.sawProgressBeforeCancel = sawProgress;
+
+      const cancelButton = lastRow() ? lastRow().querySelector('[data-export-cancel]') : null;
+      out.cancelButtonPresent = !!cancelButton;
+      if (cancelButton) cancelButton.click();
+
+      out.exportCancelled = false;
+      while (!expired()) {
+        if (phaseOf(lastRow()) === 'cancelled') {
+          out.exportCancelled = true;
+          out.cancelledSummary = lastRow().querySelector('[data-export-summary]').textContent;
+          break;
+        }
+        await sleep(100);
+      }
+
+      // Bounded, and last: closing the connection waits for the export's client to
+      // come back, so doing it while an export is still streaming would block.
+      out.stage = 'cleanup';
+      const cleanupDeadline = Date.now() + 20000;
+      try {
+        await Promise.race([
+          (async () => {
+            await db.closeConnection('smoke-export');
+            await db.deleteConnection('smoke-export');
+          })(),
+          sleep(Math.max(0, cleanupDeadline - Date.now())),
+        ]);
+      } catch (error) {
+        out.error = 'cleanup: ' + (error && error.message ? error.message : String(error));
+      }
+      out.stage = 'done';
+      return out;
+    })()`)) as Record<string, unknown>;
+        })()
+      : null;
+
+    // Read the exported files off disk, from main. A renderer reporting a finished
+    // export is exactly what a bug that wrote nothing would also report.
+    const exportedFiles = exportedPaths.map((path) => {
+      if (!existsSync(path)) return { path, exists: false, records: -1, bytes: -1 };
+      const text = readFileSync(path, 'utf8');
+      return {
+        path,
+        exists: true,
+        records: text.split('\r\n').filter((line) => line !== '').length,
+        bytes: Buffer.byteLength(text, 'utf8'),
+      };
+    });
+    const smuggledFileCreated = existsSync('/tmp/tabby-smuggled.csv');
 
     const live = liveConfigured
       ? ((await win.webContents.executeJavaScript(`(async () => {
@@ -964,6 +1564,144 @@ app
         editor['runDisabled'] === true && editor['cancelDisabled'] === true,
       ],
 
+      // ── Query history ──────────────────────────────────────────────────────
+      ['history is on the bridge', history['hasBridge'] === true],
+      [
+        'a recorded run comes back with an id and timestamp main generated',
+        history['addOk'] === true &&
+          history['addCarriesMainId'] === true &&
+          history['addCarriesMainTimestamp'] === true &&
+          history['addEchoesTheStatement'] === true,
+      ],
+      [
+        'the log lists newest first, with its status and connection',
+        history['listOk'] === true &&
+          Number(history['listCount']) === 3 &&
+          history['listNewestFirst'] === true &&
+          history['listCarriesStatus'] === true &&
+          history['listCarriesLabel'] === true &&
+          history['listSkippedNothing'] === true,
+      ],
+      [
+        'a delete removes exactly the entry main handed back an id for',
+        history['deleteOk'] === true &&
+          Number(history['countAfterDelete']) === 2 &&
+          history['deleteTwiceIsNotFound'] === true,
+      ],
+      ['a limit narrows the response', history['limitHonoured'] === true],
+      [
+        '5/5 hostile history payloads rejected, none threw, none wrote',
+        Number(history['hostileRejected']) === Number(history['hostileTotal']) &&
+          Number(history['hostileTotal']) === 5 &&
+          Number(history['hostileThrew']) === 0 &&
+          history['countUnchangedByHostile'] === true,
+      ],
+      ['an over-cap limit is refused', history['limitBeyondCapRefused'] === true],
+      [
+        'the panel opens as a labelled dialog and shows the privacy note',
+        history['togglePresent'] === true &&
+          history['panelOpened'] === true &&
+          history['panelIsDialog'] === true &&
+          history['panelIsLabelled'] === true &&
+          history['privacyNoteShown'] === true &&
+          Number(history['rowsRendered']) === 3,
+      ],
+      ['the filter narrows the list', history['filterNarrowsToOne'] === true],
+      [
+        // The property that would otherwise silently corrupt a restored query: the
+        // row shows a collapsed preview, but the editor must receive the statement.
+        'clicking a row restores the statement into the editor and closes the panel',
+        history['rowFound'] === true &&
+          history['editorReceivedStatement'] === true &&
+          history['panelClosedAfterLoad'] === true,
+      ],
+      ['Escape closes the panel', history['reopened'] === true && history['escapeClosed'] === true],
+      [
+        // Asserted from main, not from the renderer: a renderer cannot attest to
+        // its own persistence, and the privacy note is a claim about the filesystem.
+        'the log is real JSONL inside userData, one line per run',
+        historyOnDisk.includes('history.jsonl') &&
+          historyLines.length === 3 &&
+          escapedOutsideHistoryDir.length === 0,
+      ],
+      [
+        'clearing takes two clicks and then empties the panel',
+        historyCleared['clearPresent'] === true &&
+          historyCleared['firstClickOnlyArms'] === true &&
+          historyCleared['armedLabelChanged'] === true &&
+          historyCleared['emptyStateShown'] === true &&
+          Number(historyCleared['countAfterClear']) === 0,
+      ],
+      [
+        // Found by this harness, not by a unit test: the store's filter survived a
+        // close, so reopening showed one row of three. `reopenedWithRows` is the
+        // assertion that would have passed at 1 and looked fine.
+        'reopening the panel shows the whole log, not last filter',
+        historyCleared['filterResetOnReopen'] === true &&
+          Number(historyCleared['reopenedWithRows']) === 3,
+      ],
+      [
+        'clearing removes the bytes, not just the rows',
+        historyFilesAfterClear.length === 0 && historyCleared['closedAtEnd'] === true,
+      ],
+
+      // ── Command palette and theme ──────────────────────────────────────────
+      [
+        'the theme toggle flips the document and persists the choice',
+        chrome['themeTogglePresent'] === true &&
+          chrome['themeFlipped'] === true &&
+          chrome['themeMatchesSetting'] === true &&
+          chrome['themeRestored'] === true,
+      ],
+      [
+        // Computed style, so a Tailwind build that dropped the light-theme block
+        // fails here rather than shipping a toggle that only moves an attribute.
+        `the theme actually repaints (${String(chrome['backgroundBefore'])} → ${String(chrome['backgroundAfter'])})`,
+        chrome['themeActuallyRepainted'] === true && chrome['backgroundRestored'] === true,
+      ],
+      [
+        'the palette opens as a dialog and lists commands',
+        chrome['paletteButtonPresent'] === true &&
+          chrome['paletteOpened'] === true &&
+          chrome['paletteIsDialog'] === true &&
+          chrome['paletteHasInput'] === true &&
+          Number(chrome['paletteListsCommands']) >= 3,
+      ],
+      [
+        // The filtering property: a command that cannot run is not listed at all.
+        'the palette lists only commands that can actually run',
+        chrome['noQueryCommandWithoutConnection'] === true &&
+          chrome['noResultCommandWithoutResult'] === true,
+      ],
+      [
+        'export is refused while no live result is open',
+        chrome['exportDisabledWithNoResult'] === true,
+      ],
+      [
+        // 'thm' is not a substring of 'Theme': only a subsequence match finds it.
+        'a fuzzy query ranks its command first and highlights the matched letters',
+        chrome['fuzzyMatched'] === true &&
+          chrome['fuzzyTopIsTheme'] === true &&
+          chrome['matchedLettersHighlighted'] === true,
+      ],
+      ['a query that matches nothing says so', chrome['noMatchSaysSo'] === true],
+      [
+        // The matcher never builds a RegExp from the query. If it did, this would
+        // hang the renderer and the watchdog would report an unrelated timeout.
+        'regex metacharacters in a query are a non-match, not a hang',
+        chrome['metacharacterQuerySurvived'] === true,
+      ],
+      [
+        'Enter runs the top command and closes the palette',
+        chrome['enterRunsTopCommand'] === true && chrome['historyClosedAgain'] === true,
+      ],
+      [
+        'Escape closes the palette and ⌘K reopens it',
+        chrome['escapeClosedPalette'] === true &&
+          chrome['cmdKReopened'] === true &&
+          chrome['closedAtEnd'] === true,
+      ],
+
       // ── IPC contract ───────────────────────────────────────────────────────
       ['bridge exposes the db API', ipc.hasDb === true],
       ['bridge exposes event subscriptions', ipc.hasEvents === true],
@@ -1150,6 +1888,72 @@ app
             ],
           ] as [string, boolean][])),
 
+      // ── Streaming export from the UI (Phase 8 exit criterion) ────────────────
+      ...(uiExport === null
+        ? []
+        : ([
+            [
+              `ui: the export run reached a result${uiExport['error'] ? ` (${String(uiExport['error'])})` : ''}`,
+              uiExport['resultOpened'] === true,
+            ],
+            [
+              // The design's whole security argument: the renderer cannot choose a
+              // destination, so a compromised one cannot write anywhere it likes.
+              'ui: a path smuggled into exportStart is refused and nothing is written there',
+              uiExport['pathRefusedByValidator'] === true && smuggledFileCreated === false,
+            ],
+            ['ui: an unknown result cannot be exported', uiExport['unknownResultRefused'] === true],
+            [
+              'ui: the export dialog offers all four formats and no destination field',
+              uiExport['dialogOpened'] === true &&
+                uiExport['dialogIsDialog'] === true &&
+                Number(uiExport['fourFormats']) === 4 &&
+                uiExport['noPathField'] === true &&
+                uiExport['dialogSaysRowsBypassTheRenderer'] === true,
+            ],
+            [
+              'ui: Export becomes available once a live result is open',
+              uiExport['exportEnabledWithResult'] === true,
+            ],
+            [
+              'ui: a 200k-row export streams to done and the tray reports it',
+              uiExport['trayAppeared'] === true &&
+                uiExport['exportReachedDone'] === true &&
+                /200,000 rows/.test(String(uiExport['exportSummary'] ?? '')) &&
+                uiExport['cancelReplacedByDismiss'] === true,
+            ],
+            [
+              // Counted in main, off disk. A renderer reporting "done" is exactly
+              // what a bug that wrote nothing would also report.
+              'ui: the exported file really holds 200,000 records plus a header',
+              exportedFiles[0]?.exists === true && exportedFiles[0]?.records === 200_001,
+            ],
+            [
+              // The half of the exit criterion only a renderer can measure. The
+              // budget is generous on purpose: Chromium quantizes this number
+              // without --enable-precise-memory-info, so it is a magnitude check
+              // against a design where rows never cross the bridge at all.
+              `ui: the renderer heap stayed flat during the export (delta ${String(uiExport['rendererHeapDeltaMB'])}MB)`,
+              Number(uiExport['rendererHeapDeltaMB']) < 150,
+            ],
+            [
+              'ui: a large export can be cancelled mid-flight and says so',
+              uiExport['secondResultOpened'] === true &&
+                uiExport['sawProgressBeforeCancel'] === true &&
+                uiExport['cancelButtonPresent'] === true &&
+                uiExport['exportCancelled'] === true,
+            ],
+            [
+              // The cancelled file survives, and holds records — "kept the partial
+              // file" is only meaningful if there is something in it, and "partial"
+              // is only meaningful if it stopped before the end.
+              'ui: cancelling keeps a partial file that is neither empty nor complete',
+              exportedFiles[1]?.exists === true &&
+                Number(exportedFiles[1]?.records) > 1 &&
+                Number(exportedFiles[1]?.records) < 3_000_001,
+            ],
+          ] as [string, boolean][])),
+
       ['no unexpected console errors', problems.length === 0],
     ];
 
@@ -1164,7 +1968,17 @@ app
           interaction,
           tree,
           editor,
+          history: {
+            ...history,
+            onDisk: historyOnDisk,
+            linesOnDisk: historyLines.length,
+            filesAfterClear: historyFilesAfterClear,
+          },
+          historyCleared,
+          chrome,
           uiCancel,
+          uiExport,
+          exportedFiles,
           clipboard: {
             payloadLines: payloadLines.length,
             payloadFields,
